@@ -123,7 +123,7 @@ Because stack references are linear values, the stack is cleaned up by the engin
 (The stack itself might contain references to other stacks within its stack frames, so this might proceed recursively.)
 Unlike other memory management however, linearity enables this process to be done at a deterministic point in the execution, so systems that are sensitive to memory or timing can be ensured to have consistent behavior.
 
-Note that both `$resume_thread` and `$complete_work` are very simple.
+Note that both `$resume_thread` and `$complete_work` ~~are~~ should be very simple.
 As such, `stack.switch_call` for these functions does not actually need to be implemented with a true function call.
 Rather, these functions can be thought of as specifying, in a safe manner, the bookkeeping that should be done *during* the stack switch.
 
