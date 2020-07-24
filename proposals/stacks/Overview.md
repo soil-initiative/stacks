@@ -2,7 +2,7 @@
 
 There are a number of control-flow patterns that go beyond the classic "last-in first-out" form.
 Coroutining, iterators based on yield, asynchronous I/O and, more exotically, delimited continuations, are all examples of non-linear control flow.
-These patterns are becoming increasingly important in programming languages.
+These patterns are becoming increasingly important in applications that are intended to be dynamically responsive.
 
 While it is possible to emulate many of these control-flow patterns using standard core WASM features, there is significant cost in doing so &mdash; in terms of run-time efficiency, code size, and composability.
 
@@ -397,7 +397,7 @@ inquire $dispatch_tag : [ti*] -> [to*]
 where `$dispatch_tag` is a dispatch tag, i.e. a generalization of the function-type signature used in `call_indirect`, of type `[ti*] -> [to*]`.
 Handlers on the stack take the form of a `respond $dispatch_tag` block whose body responds to the inquiry with instructions that generate outputs matching the types specified by the dispatch tag.
 
-Normally `respond $dispatch_tag` would follow a `try` block, per standard exception handling, but in this proposal we also allow it to follow `stack.attach_clear` and `stack.attach_call`.
+Normally `respond $dispatch_tag` would follow a `try` block, per standard exception handling, but in this proposal we also allow it to follow `stack.attach_clear`.
 Furthermore, when used in this manner, the body of the `respond` block can use a special `stack.detach` instruction:
 
 ```
@@ -526,32 +526,102 @@ So instead here we demonstrate how stack inspection can be used to implement tag
 
 ## Summary
 
-The proposal adds one more type for stack references, `stackref`, and a variant on `func` called a `rout`, and four more instructions for stack switching (beyond the general-purpose instructions for dealing with a linear type):
-1. `stack.switch $event : [t* stackref] -> unreachable` switches control to the given stack using the specified `event`, leaving the current stack waiting for an event that is thrown once received
-2. `stack.extend $rout : [t* stackref] -> [stackref]` extends a given stack with a stack frame for the specified `rout`
-3. `stack.switch_call $func $event : [ti* stackref] -> unreachable` switches control to the given stack using the specified `event` *after* it makes a call to the specified `func`, leaving the current stack waiting for an event that is thrown once received
-4. `try instr1* redirect instr2* restore instr3* end` redirects stack walks from within the `try` block to a `stackref` that is dynamically determined by the `redirect` block and which is later returned to the `restore` block
+This proposal outlines a suite of features that can be used to implement various patterns of non-sequential control flow: coroutines (both symmetric and asymmetric), support for asynchronous I/O, yield-style generators and many more.
 
-Note that this proposal depends only on the exception-handling proposal (and takes advantage of some recent changes therein).
+The key abstractions revolve around the concept of a stack as a manageable entity and switching control between stacks.
 
-## Listing of new features
+In order to support these, we identify two main gaps in the WebAssembly architecture: support for stack inspections and support for linearly typed variables. We explicate them here to the extent necessary for our primary use-case; but they deserve independent proposals as they have other applications.
 
-### types
+
+
+## Appendix: Listing of new features
+
+The features described can be categorized into different areas: support for linear types, support for stack inspection and support for stack switching. Although stack switching depends on the former two, they are potentially separable as linear type operations and stack inspection have other applications.
+
+### Linear types
+
+These instructions are used to support linearly typed variables; they generally combine a uniqueness requirement with atomic access to memory.
+
+
+* `global.get_clear`
+
+`global.get_clear` accesses a global memory location and sets the location to null after accessing the value.
+
+```
+global.get_clear $global : [] -> [t]
+```
+
+* `global.set_cleared`
+
+`global.set_cleared` sets a global variable to the value on the stack; a trap results if the global memory was not null at the start of the operation.
+
+```
+global.set_cleared $global : [t] -> []
+```
+
+* `local.get_clear`
+
+`local.get_clear` accesses a local variable and sets the variable to null after accessing the value.
+
+```
+local.get_clear $local : [] -> [t]
+```
+
+* `local.set_cleared`
+
+`local.set_cleared` sets a local variable to the value on the stack; a trap results if the variable was not null at the start of the operation.
+
+```
+local.set_cleared $local : [t] -> []
+```
+
+* `table.get_clear`
+
+
+`table.get_clear` accesses a table entry and sets the entry to null after accessing the value.
+
+```
+table.get_clear $table : [i32] -> [t]
+```
+
+* `table.set_cleared`
+
+`table.set_cleared` sets a table entry to the value on the stack; a trap results if the table entry was not null at the start of the operation.
+
+```
+table.set_cleared $table : [i32 t] -> []
+```
+
+### Stack inspection
+
+We list only a few of the features that we would expect from a complete suite of operations for stack inspection.
+
+* `inquire`
+
+`inquire` searches the stack for a handler for a given call tag and invokes that handler with the additional arguments provided.
+
+```
+inquire $call_tag : [ti*] -> [to*]
+```
+
+* `respond`
+
+The `respond` form establishes a handler for a given call tag.
+
+```
+respond $label ins* end
+```
+
+### Stack Management
+
+#### types
 
 * `leafRef`
 
 * `stackRef`
 
-### Instructions
+#### Instructions
 
-* `inquire`
-
-```
-inquire $dispatch_tag : [ti*] -> [to*]
-```
-
-
-* `stack.attach_call`
 
 
 * `stack.attach_clear`
@@ -603,61 +673,16 @@ stack.switch $event : [t* leafref] -> unreachable
 stack.switch_call $func $event : [ti* leafref] -> unreachable
 ```
 
-
-* `global.get_clear`
-
-```
-global.get_clear $global : [] -> [t]
-```
-
-* `global.set_cleared`
-
-```
-global.set_cleared $global : [t] -> []
-```
-* `local.get_clear`
-
-```
-local.get_clear $local : [] -> [t]
-```
-
-* `local.set_cleared`
-
-```
-local.set_cleared $local : [t] -> []
-```
-
-* `table.get_clear`
-
-```
-table.get_clear $table : [i32] -> [t]
-```
-
-* `table.set_cleared`
-
-```
-table.set_cleared $table : [i32 t] -> []
-```
-
 ### New forms
 
 * `rout` function
 
-* `try redirect`
 
-```
-try instr1* redirect instr2* restore instr3* end
-```
 
-* `respond` $event block
-
-```
-respond $label ins* end
-```
 
 ## FAQ Frequently Asked Questions (FAQ)
 
-#### How does this relate to other proposals?
+### How does this relate to other proposals?
 
 There are three prior proposals-of-sorts on this topic, each of which had significant influence on the design we developed:
 1. [Andreas Rossberg's presentation at the Feb 2020 In-Person CG Meeting](https://github.com/WebAssembly/meetings/blob/master/main/2020/presentations/2020-02-rossberg-continuations.pdf) inspired our heavy use of events
@@ -684,12 +709,12 @@ Similarly, a branch jumps to the code pointer *and* cleans up the stack below th
 The fact that labels and the like are established through syntactic nesting is what necessitated `rout` as a distinct concept from `func`.
 This is not to say this bundling is a fault in the design of WebAssembly, since in many ways we benefited from it, but it is important for understanding the rationale behind the design of this proposal and why certain instructions/constructs could not be decomposed further.
 
-#### What are the key dependencies?
+### What are the key dependencies?
 
 The entire proposal is dependent on [exception handling](https://github.com/WebAssembly/exception-handling/), and the `stackref` portion is dependent on stack inspection.
 There is no dependency on [garbage collection](https://github.com/WebAssembly/exception-handling/), though garbage collection would have to be amended to accommodate linear types.
 
-#### What are the implications for JavaScript and browser interoperability?
+### What are the implications for JavaScript and browser interoperability?
 
 This proposal was designed to not introduce any significant complications with JavaScript interoperability.
 Browsers already need to deal with computations being suspended midflight with their stacks put aside until later due to preemptive multi-tasking; this proposal just enables that suspension to occur (cooperatively) within a thread.
@@ -699,17 +724,3 @@ As such, there is no way to use this proposal to somehow escape the event loop.
 Of course, just like JavaScript programs can run an infinite while loop, WebAssembly programs can switch between stacks infinitely.
 That is, just like JavaScript developers, any design using this proposal needs to be conscious of the run-to-completion model.
 For example, our thread-manager example does not complete until the work is completely done, but it would be easy to modify it to have the scheduler return to the caller once in a while, relying on the caller to schedule an event that will call back into the instance and resume the scheduler.
-
-## Editorial Notes:
-
-* Perhaps we do not need both `stack.switch` and `stack.switch_call`. My preference would be to just have the former. My reasoning is that the toolchain will be generating this code anyway, and will likely only pick one method; and `stack.switch` is much simpler.
-
-* There is a meta question: the extent to which code that uses stack switching has to be written for it; this includes wrapper code at places where switching may occur.
-
-* Somewhat worried by the implicit cleanup implied by dropping a stack. Would prefer that that be arranged differently (e.g., by forcing an `abort` event on the dropped stack).
-
-* I would definitely go for making `stack.create` an instruction. If only to reduce the cognitive burden of understanding the proposal. Suggestion: do not have a mechanism for creating attached stacks, use `stack.create` followed by attach.
-
-* Stack (de)composition needs more TLC. Too many new/special features.
-
-* How does `catch $resume $resumed` work? This could use a bit more explanation.
