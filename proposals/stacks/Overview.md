@@ -680,7 +680,7 @@ stack.switch_call $func $event : [ti* leafref] -> unreachable
 
 
 
-## FAQ Frequently Asked Questions (FAQ)
+## Appendix: FAQ Frequently Asked Questions (FAQ)
 
 ### How does this relate to other proposals?
 
