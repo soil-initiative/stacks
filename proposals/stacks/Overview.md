@@ -24,62 +24,53 @@ In this document we explain the main aspects of the design for *multiple stacks*
 At the core of this proposal is the ability to create and switch between multiple stacks.
 Our running example will be a lightweight thread manager, in which each lightweight thread has its own stack, and the manager switches between these stacks (and its own).
 
-### Leaf References
+### Stack References
 
 A stack has two endpoints: its *root* (i.e. initial frame), and its *leaf* (i.e. active frame).
-Both prior proposals for stack switching have used references to the *root* of the stack, and implemented switching through *yielding* and *resuming*.
-But the root of a stack does not know where its leaf is, and when you resume to a stack its the leaf rather than the root that tells you what to update the stack-pointer and instruction-pointer registers to.
-As such, both prior proposals implemented stack yielding by walking the stack to find its root and store a pointer to the current leaf in the root.
-All in all, this made stack switching more expensive than it needs to be.
-
-Here we instead propose to use references to the *leaf* of the stack.
-And rather than yielding and resuming stacks, we simply switch stacks.
-In a stack switch, the current stack transfers control to a given leaf reference for some stack and hands off the reference to the current stack's own leaf in the process.
-This conceptually amounts to simply swapping the current contents of the stack- and instruction-pointer registers with whatever registers are (together) holding the leaf reference of the target stack.
-In particular, there is no need to search the stack to find the root of the current stack.
-
-We give these leaf-reference values the type `leafref`.
+In this proposal, a `stackref` is a reference to the *leaf* of a stack.
+Consequently, we can switch between stacks by simply swapping the current contents of the stack- and instruction-pointer registers with whatever registers are (together) holding the leaf reference of the stack being switched to.
+In particular, there is no need to search the stack to find the root of the current stack in order to *detach* it, a topic we discuss later.
 
 #### Linearity
 
-Once someone switches to the leaf reference of some stack, it is important that no one else switch to that same leaf reference.
-The reason is that the stack changes immediately when it is switched to, invalidating the stack- and code-pointer that comprised the leaf reference.
-For this reason, `leafref` must be a (nearly) *linear* type so that its values cannot be duplicated.
+Once someone switches to some stack, it is important that no one else switch to that same stack.
+The reason is that the stack changes immediately when it is switched to, invalidating the stack- and code-pointer that comprised the reference.
+For this reason, `stackref` must be a (nearly) *linear* type so that its values cannot be duplicated.
 This requires some clarifications for and variations to a few instructions.
 In particular, various `get` and `set` instructions would be disallowed for linear types, and instead one would use `get_clear` (which replaces the read variable's contents with null) and `set_cleared` (which traps if the variable's contents were not null).
 But overall, most of WebAssembly is unphased.
+(Although linear types are difficult to use in type systems for high-level languages, they align well with type systems for low-level languages.)
 
 ### Stack Switching
 
 The key operation in this proposal is the stack switch.
 When a stack switch occurs, one generally provides values for the target stack to resume execution with.
 The question is what should the types of these values be?
-There seems to be no good universal answer, and having each `leafref` *statically* specify the expected types would both complicate the type system and restrict usage patterns.
+There seems to be no good universal answer, and having each `stackref` *statically* specify the expected types would both complicate the type system and restrict usage patterns.
 So instead we use a *dynamic* convention, repurposing events provided by exception handling.
-That is, the stack giving control specifies an event tag and arguments corresponding to that event tag, and the stack receiving control checks that event tag to determine what to do.
+That is, the stack giving control specifies an event and arguments corresponding to that event, and the stack receiving control checks that event to determine what to do.
 
 This is achieved by the following instruction:
 ```
-stack.switch $event : [t* leafref] -> unreachable
+stack.switch $event : [t* stackref] -> unreachable
 ```
-The `leafref` on the stack is the stack to switch to (trapping if that `leafref` is null).
-The `$event` specifies the event to use for the transfer and must have type `[t* leafref]`.
+The `stackref` is the stack to switch to (trapping if that `stackref` is null).
+The `$event` specifies the event to use for the transfer and must have type `[t* stackref]`.
 The values for the `t*` of the event are given by the `t*` on the stack.
-The value of the `leafref` of the event is the leaf reference of the current stack that is giving up control.
+The value of the `stackref` of the event is the reference to the current stack that is giving up control.
 
-This leaves the stack in a halted state, waiting for control to eventually be transferred back.
+This leaves the stack that was switched from in a halted state, waiting for control to eventually be transferred back.
 When control is transferred back, some event is supplied.
-This event is received using existing (revised) exception-handling mechanisms.
+This event is received using existing exception-handling mechanisms.
+There is currently discussion on how to revise the exception-handling proposal to better support two-phase stack unwinding (and similarly this proposal), so for this document we suppose a `try instr*` block can be followed by multiple `catch $event $label` instructions indicating to transfer control to `$label` on `$event` exceptions.
 
 Although the most straightforward way to implement event handling is using a stack walk, typically the relevant event handler for a `stack.switch` will be in the immediate scope, so engines will likely want to optimize their implementation by directing control straight to that handler.
 
->Can we require that the event handler is syntactically local?
-
-The following illustrates how a lightweight thread could yield control to a central thread manager by fetching that `leafref` and switching to it with the `$thread_yielded` event:
+The following illustrates how a lightweight thread could yield control to a central thread manager by fetching that `stackref` and switching to it with the `$thread_yielded` event:
 ```
-(event $thread_yielded (param leafref))
+(event $thread_yielded (param stackref))
 (event $resume (param))
-(global $manager (param leafref))
+(global $manager (param stackref))
 
 (func $yield_current_thread
   (block $resumed
@@ -91,23 +82,24 @@ The following illustrates how a lightweight thread could yield control to a cent
 )
 ```
 
->Here we have assumed that whenever the thread manager transfers control to a thread, its `leafref` is stored into the global variable `$manager`. A more sophisticated system &mdash; involving communication channels for example &mdash; would use a different bookkeeping mechanism.
+Here we have assumed that whenever the thread manager transfers control to a thread, its `stackref` is stored into the global variable `$manager`.
+A more sophisticated system&mdash;involving communication channels for example&mdash;would use a different bookkeeping mechanism.
 
-Note that the `$resume` event does not have a `leafref` in its payload. This is because the thread manager uses a more advanced stack-switching instruction to resume a thread.
+Note that the `$resume` event does not have a `stackref` in its payload.
+This is because the thread manager uses a more advanced stack-switching instruction to resume a thread.
 
 ### Advanced Stack Switching
 
-With `stack.switch`, the stack receiving control is always responsible for storing the `leafref` of the stack yielding control.
-However, often the stack yielding control is the one that better knows what to do with its own `leafref`.
+With `stack.switch`, the stack receiving control is always responsible for storing the `stackref` of the stack yielding control.
+However, often the stack yielding control is the one that better knows what to do with its own `stackref`.
 To support this pattern, we provide the instruction:
-
 ```
-stack.switch_call $func $event : [ti* leafref] -> unreachable
+stack.switch_call $func $event : [ti* stackref] -> unreachable
 ```
+where `event $event : [to*]` and `func $func : [ti* stackref] -> [to*]`.
+I.e., the event does not reference the `stackref` of the yielding stack.
 
-where `event $event : [to*]` and `func $func : [ti* leafref] -> [to*]`. I.e., the event does not reference the `leafref` of the yielding stack.
-
-This instruction switches control to the given `leafref` but has the receiving stack immediately call `$func` with the given arguments and the `leafref` for the *yielding* stack.
+This instruction switches control to the given `stackref` but has the receiving stack immediately call `$func` with the given arguments *and* the `stackref` for the *yielding* stack.
 When `$func` returns, its result is then used to determine the arguments for the `$event` that the stack is waiting for.
 
 With this we can use the following events and functions
@@ -115,16 +107,16 @@ With this we can use the following events and functions
 (type $product ...)
 (event $work_completed (param $product))
 
-(func $resume_thread (param $thread leafref)
+(func $resume_thread (param $thread stackref)
   (global.set_cleared $manager (local.get $thread))
 )
-(func $complete_work (param $work $product) (param $thread leafref) (result $product)
+(func $complete_work (param $work $product) (param $thread stackref) (result $product)
   (local.get $work)
 )
 ```
 so that when the manager resumes a thread it can do so with simply `stack.switch_call $resume $resume_thread`, which takes care of updating the global `$manager` variable, and when a thread completes it can do so with simply `stack.switch_call $complete_work $work_completed`.
 
-Note that `$complete_work` implicitly drops the given `leafref`.
+Note that `$complete_work` implicitly drops the given `stackref`.
 
 Because stack references are linear values, the stack is cleaned up by the engine once the stack frame it is stored in is cleaned up, so `$complete_work` implicitly performs this clean up before returning.
 (The stack itself might contain references to other stacks within its stack frames, so this might proceed recursively.)
@@ -133,25 +125,26 @@ Unlike other memory management however, linearity enables this process to be don
 Note that both `$resume_thread` and `$complete_work` are very simple.
 As such, `stack.switch_call` for these functions does not actually need to be implemented with a true function call.
 Rather, these functions can be thought of as specifying, in a safe manner, the bookkeeping that should be done *during* the stack switch.
+Conceptually, the call should always be inlined, though there is no way to force that implementation in a high-level semantics.
 
-### Stack Creation, Part 1
+### Stack Creation
 
-One of our invariants is that a `leafref` always references an *attached* stack.
+One of our invariants is that a `stackref` always references an *attached* stack.
 That is, if one were to walk the stack from the leaf, one would always reach a special *grounding* frame created by the host.
 This grounding frame is responsible in particular for handling traps, whether by terminating the thread executing the trapping stack or by moving to the next event in the queue or by reporting an error and so on.
-The point is, only the host can create grounding frames, and the semantics of these grounding frames depend on context, so we provide no means to create leaf references out of thin air.
+The point is, only the host can create grounding frames, and the semantics of these grounding frames depend on context, so we provide no means to create stack references out of thin air.
 Instead, a module that needs this functionality must import a function from the host, which the host can then instantiate with whatever is appropriate for the module instance's execution environment.
 
 For our running implementation of lightweight threads, each thread stack needs such a grounding frame.
 As such, the module imports a `$new_stack` function from the host, which it uses each time it needs to spawn a new thread.
 ```
-(import "host" "new_stack" (func $new_stack (result leafref)))
+(import "host" "new_stack" (func $new_stack (result stackref)))
 (type $task ...)
-(table $thread_pool 1000 leafref)
+(table $thread_pool 1000 stackref)
 (global $current i32 (i32.const 999))
 (func $find_noncurrent_null_in_thread_pool (result i32) ...)
 
-(func $spawn_thread (param $work $task) (result i32) (local $id i32) (local $stack leafref)
+(func $spawn_thread (param $work $task) (result i32) (local $id i32) (local $stack stackref)
   (local.set $id (call $find_noncurrent_null_in_thread_pool))
   (local.set_cleared $stack (call $new_stack))
   (local.set_cleared $stack (stack.extend $thread_rout (local.get $id) (local.get $work) (local.get_clear $stack)))
@@ -163,16 +156,16 @@ As such, the module imports a `$new_stack` function from the host, which it uses
 The `$spawn_thread` function finds an unused identifier for the thread, uses the imported `$new_stack` function to create a new attached stack, then *extends* that stack with a custom frame, and finally adds the thread to the pool, returning its identifier.
 
 The extension step is critical.
-Realize that all the imported `$new_stack` function does is provide a `leafref` for some new stack, one that is conceptually blank besides its grounding frame.
+Realize that all the imported `$new_stack` function does is provide a `stackref` for some new stack, one that is conceptually blank besides its grounding frame.
 
 In order to give this stack some functionality specific to the application at hand, one must extend the given stack with a special kind of call frame specific to the application at hand.
 Because this concept is inspired by coroutines and typically is used to set up the root of the stack, we call this special kind of function a `rout`.
 The following is an example `rout` for a lightweight thread:
 ```
-(event $abort : [stackref])
+(event $abort : [stacksegref])
 (event $thread_aborted : [])
 (func $do_work (param $task) (result $product) ...)
-(func $finish_aborting (param $thread leafref)
+(func $finish_aborting (param $thread stackref)
   ;; implicitly cleanup the thread stack now that we're done with it
 )
 
@@ -188,25 +181,29 @@ The following is an example `rout` for a lightweight thread:
       (local.set $output (call $do_work (local.get $input))
       (stack.switch_call $work_completed $complete_work (local.get $output) (global.get_clear $manager))
     catch $abort $aborted
-    catch_all
-      unreachable
     )
-  ) ;; $aborted : [leafref]
+  ) ;; $aborted : [stackref]
   (stack.switch_call $thread_aborted $finish_aborting)
 )
 ```
 
-A `rout` is similar to a `func` in many ways. There are a few differences: the first instructions of the body must be instructions like `block` and `try` that do nothing besides set up control flow, followed by `stack.start`. This sets up a stack frame that is awaiting an event and set to handle that event.
-Another difference is that the type signature of a `rout` never has a return type - because it does not return a value.
+A `rout` is similar to a `func` but with one critical difference: the first instructions of the body must be instructions like `block` and `try` that do nothing besides set up control flow, followed by `stack.start`.
+This sets up a stack frame that is awaiting an event and set to handle that event.
 
-The instruction `stack.extend $rout $event? : [ti* leafref] -> [leafref]`, where `$rout` is a `rout (param ti*) (result to*)` and `$event` (if specified) is an `event (param to*)`, extends the given stack with the frame for `$rout` with the given values as its arguments.
-The resulting stack is waiting at the instruction `stack.start : [] -> unreachable` for an event.
-(`stack.start` is only usable at the near-start of a `rout`.)
-If an `$event` is specified, then once the stack is switched to and handled by the `rout` such that it returns, the returned values are forwarded to the `leafref` the `rout` was attached to with the specified event.
+To add a `rout` stack-frame to a stack, one uses the following instruction:
+```
+stack.extend $rout $event? : [ti* stackref] -> [stackref]
+```
+where `$rout` is a `rout (param ti*) (result to*)` and `$event` (if specified) is an `event (param to*)`, extends the given stack with the frame for `$rout` with the given values as its arguments.
+The resulting stack is waiting for an event at the following special instruction that is only usable at the near-start of a `rout`:
+```
+stack.start : [] -> unreachable
+```
+If an `$event` is specified, then once the stack is switched to and handled by the `rout` such that it returns, the returned values are forwarded to the `stackref` the `rout` was attached to with the specified event.
 If no `$event` is specified, then the `rout` traps if it returns.
-Any unhandled exceptions thrown from the `rout` are forwarded to the `leafref` the `rout` was attached to.
+Any unhandled exceptions thrown from the `rout` are forwarded to the `stackref` the `rout` was attached to.
 
-So if one calls an imported function `$new_stack : [] -> [stackref]` and then executes `(stack.extend $thread_rout (i32.const 237) $work)`, that altogether creates a new stack that is
+So if one calls an imported function `$new_stack : [] -> [stacksegref]` and then executes `(stack.extend $thread_rout (i32.const 237) $work)`, that altogether creates a new stack that is
 1. waiting for its first `$resume` event,
 2. upon which it will call `$do_thread_work` with the given `$work`,
 3. which in turn can yield control to the thread manager via `(call $yield_current_thread)` (defined above),
@@ -214,7 +211,7 @@ So if one calls an imported function `$new_stack : [] -> [stackref]` and then ex
 
 ### Stack Cleanup
 
-Notice that `$thread_rout` also handles an `$abort` event, which provides a `leafref` in its payload.
+Notice that `$thread_rout` also handles an `$abort` event, which provides a `stackref` in its payload.
 This is used to unwind the stack of a thread that has been aborted.
 Although discarding a leaf reference implicitly causes the stack to be cleaned up, along with any stacks that it contains references to, this process does nothing more than memory management.
 That is, besides side channels like timing behavior, this process has no visible semantic effect.
@@ -227,8 +224,6 @@ Because we build upon exception-handling events, this can be done simply with th
     (try
       (stack.switch $abort (table.get_clear $thread_pool (local.get $id)))
     catch $thread_aborted $aborted
-    catch_all
-      unreachable
     )
   )
 )
@@ -237,7 +232,7 @@ Note that the `$yield_current_thread` function does not handle the `$abort` even
 As such, when a yielded thread stack is switched to, the event gets thrown as an exception.
 The expectation is that, except for its root `$thread_rout`, the thread will not catch the `$abort` event.
 This in turn causes all of the unwinding code on its stack to execute.
-As for `$thread_rout`, the switch in `$abort_thread` packages the `leafref` of whoever called `$abort_thread`, which `$thread_rout` finally extracts and switches control back to (implicitly cleaning up the last remnants of the aborted thread's stack in the process).
+As for `$thread_rout`, the switch in `$abort_thread` packages the `stackref` of whoever called `$abort_thread`, which `$thread_rout` finally extracts and switches control back to (implicitly cleaning up the last remnants of the aborted thread's stack in the process).
 
 ### Application&mdash;Lightweight Threads
 
@@ -265,10 +260,8 @@ In our example, results are never null (i.e. null indicates the thread has not c
             (stack.switch_call $resume $resume_thread (table.get_clear $thread_pool (global.get $current)))
           catch $thread_yielded $yielded
           catch $work_completed $completed
-          catch_all
-            unreachable
           )
-        ) ;; $yielded : [leafref]
+        ) ;; $yielded : [stackref]
         (table.set_cleared $thread_pool (global.get $current))
         (br $round_robin)
       ) ;; $completed : [$product]
@@ -291,7 +284,7 @@ In our example, results are never null (i.e. null indicates the thread has not c
 
 The main program first spawns a "primary" thread with the work at hand.
 Then it round robins through the threads until the primary thread completes.
-If a thread yields, its `leafref` is stored into the `$thread_pool` table.
+If a thread yields, its `stackref` is stored into the `$thread_pool` table.
 If a thread completes, the result is stored into the `$intermediate_results` table, and the cycle guarantees that every thread that depends on that work has a chance to fetch it from the table before it is cleared.
 After the primary thread finishes, all the threads are aborted before returning the final result in order to run any unwinding code (e.g. destructors) on their stacks.
 
@@ -328,69 +321,69 @@ We emphasize that this is not the only way this can be done&mdash;the instructio
 
 And with that, we have efficient lightweight threads without any stack walking (except to cleanup/unwind stacks) or any cyclic garbage collection or reference counting.
 
-## Design: Detachable Stacks
+## Design: Stack Segments
 
-So far all stacks have been *attached*, meaning they have a grounding frame provided by the host and can be directly switched to via their `leafref`.
-But sometimes a portion of a stack needs to be detached so that it can be saved for later and run on a different stack.
-Our running example for this will be asynchronous I/O, in which its useful to detach the portion of the stack belonging to the WebAssembly application at hand so that it can be run later after an asynchronous action has completed.
+So far all stacks have been *attached*, meaning they have a grounding frame provided by the host and can be directly switched to via their `stackref`.
+But sometimes a *segment* of a stack needs to be *detached* so that it can be saved for later and run on a different stack.
+In addition to `stackref`, we introduce `stacksegref` for references to such sack segments.
+Our running example for sack segments will be asynchronous I/O, in which its useful to detach the portion of the stack belonging to the WebAssembly application at hand so that it can be run later after an asynchronous action has completed.
 
-### Stack Creation, Part 2
+### Stack-Segment Creation
 
-The proposal never lets one detach a stack arbitrarily.
-Instead, one creates detached stacks that they can attach to and detach from the current stack.
-Whereas we provide no instruction for creating *attached* stacks, since these need a grounding frame that only the host has the appropriate context to create, we do provide the following instruction for creating *detached* stacks, which later can be attached to attached stacks with grounding frames:
+The proposal never lets one arbitrarily break a stack apart into stack segments.
+Instead, one creates stack segments that they can attach to and detach from the stacks.
+Whereas we provide no instruction for creating *stacks*, since these need a grounding frame that only the host has the appropriate context to create, we do provide the following instruction for creating stack *segments*, which later can be attached to attached stacks with grounding frames:
 ```
-stack.create : [] -> [stackref]
+stack.create : [] -> [stacksegref]
 ```
-This instruction introduces the type `stackref`, which conceptually is a pair of references to both the root and the leaf of a detached stack.
-The root is waiting for a `leafref` to attach the stack to.
+This instruction introduces the type `stacksegref`, which conceptually is a pair of references to both the root and the leaf of a detached stack segment.
+The root is waiting for a `stackref` to attach the segment to.
 The leaf is set up to just forward whatever event is received to whatever the root is attached to.
-In other words, the newly created stack is empty, at least at the moment.
+In other words, the newly created stack segment is empty, at least at the moment.
 
-Just like with leaf references, we can extend a `stackref` with a `rout` to give it some application-specific functionality.
-The instruction:
-
+Just like with stacks, we can extend a `stacksegref` with a `rout` to give it some application-specific functionality.
+This is done using the following instruction:
 ```
-stack.extend_leaf $rout $event? : [ti* stackref] -> [stackref]
+stack.extend_leaf $rout $event? : [ti* stacksegref] -> [stacksegref]
 ```
-
 where `$rout` is a `rout (param ti*) (result to*)` and `$event` (if specified) is an `event (param to*)`, extends the given stack with the frame for `$rout` with the given values as its arguments.
-Note that this instruction consumes and produces a `stackref`.
-This is because, like `leafref`, the `stackref` type is linear.
+Note that this instruction consumes and produces a `stacksegref`.
+This is because, like `stackref`, the `stacksegref` type is linear.
 
 ### Stack Composition
 
-Because a `stackref` is detached, we can compose them with various stack references.
-One way to do so is to generalize `rout` a bit.
-In particular, in place of `stack.start`, we allow a `rout` to use `stack.attach_clear $local`, where `$local` is a local variable of type `stackref`.
-This instruction indicates to initially configure the `rout` to have the `stackref` in the local variable be attached (and clears the content of the variable).
-So any event received by the `rout` goes to the leaf of the given `stackref`, and escaping events thrown in the given `stackref` propagate to the `rout`.
-
-As an example, the following illustrates how to compose two `stackref`s together:
+Because a `stacksegref` is detached, we can compose it with a stack or a stack segment.
+For the latter, we generalize `rout` a bit.
+In particular, in place of `stack.start`, we allow a `rout` to alternatively use the following special instruction:
 ```
-(rout $attach_rout (param $inner stackref)
+stack.attach_clear $local
+```
+where `$local` is a local variable of type `stacksegref`.
+This instruction indicates to initially configure the `rout` to have the `stacksegref` in the local variable be attached (and clears the content of the variable).
+So any event received by the `rout` goes to the leaf of the given `stacksegref`, and escaping events thrown in the given `stacksegref` propagate to the `rout`.
+
+As an example, the following illustrates how to compose two `stacksegref`s together:
+```
+(rout $attach_rout (param $inner stacksegref)
   (stack.attach_clear $inner)
 )
-(func $compose (param $outer stackref) (param $inner stackref) (result stackref)
+(func $compose (param $outer stacksegref) (param $inner stacksegref) (result stacksegref)
   (stack.extend_leaf $attach_rout (local.get_clear $inner) (local.get_clear $outer))
 )
 ```
 
-We can also attach a `stackref` to the *current* stack.
-This is done using the instruction:
-
+We can also attach a `stacksegref` to the *current* stack.
+This is done using the following instruction:
 ```
-stack.attach_switch $event : [t* stackref] -> unreachable
+stack.attach_switch $event : [t* stacksegref] -> unreachable
 ```
-
-where the specified event `$event : [t*]` is used to transfer control to the leaf of the given `stackref` after attaching it.
-This will be particularly useful for resuming computation on a `stackref` that was saved earlier using the following detaching process.
+where the specified event `$event : [t*]` is used to transfer control to the leaf of the given `stacksegref` after attaching it.
+This will be particularly useful for resuming computation on a `stacksegref` that was saved earlier using the following detaching process.
 
 ### Stack Decomposition
 
-For detaching stacks, we expand upon stack inspection, i.e. the first phase of two-phase exception handling.
+For detaching stack segments, we expand upon stack inspection, i.e. the first phase of two-phase exception handling.
 We describe stack inspection in more detail below, but in short one inspects the stack with the instruction
-
 ```
 inquire $dispatch_tag : [ti*] -> [to*]
 ```
@@ -399,14 +392,13 @@ Handlers on the stack take the form of a `respond $dispatch_tag` block whose bod
 
 Normally `respond $dispatch_tag` would follow a `try` block, per standard exception handling, but in this proposal we also allow it to follow `stack.attach_clear`.
 Furthermore, when used in this manner, the body of the `respond` block can use a special `stack.detach` instruction:
-
 ```
 stack.detach $responder $rout $label : [ti* tl*] -> unreachable
 ```
 The `$responder` indicates which containing `respond $dispatch_tag` block to detach up to, where `$dispatch_tag` must have output type `[to*]`.
 The `$rout` is a `rout` of type `[ti*] -> [to*]`; it is put on the detached stack in order to handle the stack-switching event, and is configured so that its returned values provide the response for the `respond` block.
-Lastly, control is transferred to the label `$label` *outside* of the `respond` block, where `$label` has type `[tl* stackref]`&mdash;the final `stackref` is then the reference to the stack that was just detached.
-The unfortunate complexity of the instruction is due to the fact that the content of the current stack needs to be examined by the `$responder` in order to determine *if* the stack should be detached (and the `$label` specifies how), but the rest of the response must not depend on the current stack because it might be concluded after being attached to a completely different stack (so the `$rout` specifies how to conclude the response).
+Lastly, control is transferred to the label `$label` *outside* of the `respond` block, where `$label` has type `[tl* stacksegref]`&mdash;the final `stacksegref` is then the reference to the stack segment that was just detached.
+The unfortunate complexity of the instruction is due to the fact that the content of the current stack needs to be examined by the `$responder` in order to determine *if* the stack segment should be detached (and the `$label` specifies how), but the rest of the response must not depend on the current stack because it might be concluded after being attached to a completely different stack (so the `$rout` specifies how to conclude the response).
 
 ### Application&mdash;Async/Await
 
@@ -432,14 +424,14 @@ Using this proposal, we can implement `$await` within WebAssembly:
   (inquire $awaiting (local.get $promise))
 )
 ```
-This starts a stack inspection, with the intent that it will cause the current stack to be detached and registered with the `externref` promise, eventually responding with the value the promise resolves to.
+This starts a stack inspection, with the intent that it will cause the current stack segment to be detached and registered with the `externref` promise, eventually responding with the value the promise resolves to.
 
-For that to happen, an `$awaiting` handler on the stack needs to actually detach the stack and such.
+For that to happen, an `$awaiting` handler on the stack needs to actually detach the stack segment and such.
 The following is one example of such a handler:
 ```
 (event $fulfilled (param externref))
 (event $finished (param externref))
-(import (func $create_promise (param externref stackref) (result externref)))
+(import (func $create_promise (param externref stacksegref) (result externref)))
 
 (rout $resumer (result externref)
   (block $resumed
@@ -449,7 +441,7 @@ The following is one example of such a handler:
     )
   ) ;; $resumed : [externref]
 )
-(func $fulfill (export "fulfill") (param $stack stackref) (param $value externref) (result externref)
+(func $fulfill (export "fulfill") (param $stack stacksegref) (param $value externref) (result externref)
   (block $finish
     (try
       (block $yielded
@@ -457,25 +449,25 @@ The following is one example of such a handler:
         (respond $responder $awaiting ;; [externref] -> [externref]
           (stack.detach $responder $resumer $yielded)
         )
-      ) ;; $yielded : [externref stackref]
+      ) ;; $yielded : [externref stacksegref]
       (return (call $create_promise))
     catch $finished $finish
     )
   ) ;; $finish : [externref]
 )
 ```
-The `$fulfill` function attaches the given `stackref` and switches to it with the `$fulfill` event, which is used to indicate that the value the stack was waiting for has been provided (as the payload of the event).
+The `$fulfill` function attaches the given `stacksegref` and switches to it with the `$fulfilled` event, which is used to indicate that the value the stack was waiting for has been provided (as the payload of the event).
 That stack might finish, indicating the `$main` program is all done, in which case it "returns" with the `$finished` event and the result of the payload.
 So `$fulfill` catches that event and returns its payload.
 However, the stack might also end up waiting for some other promise.
-In this case, `$responder` detaches the stack, using `$resumer` to respond with the payload of any future `$fulfill` event, and then hands off the promise and the detached stack to `$yielded`.
+In this case, `$responder` detaches the stack segment, using `$resumer` to respond with the payload of any future `$fulfill` event, and then hands off the promise and the detached stack segment to `$yielded`.
 This in turn creates a promise, returning it as the (incomplete) result of `$fulfill`, using the imported function `$create_promise`.
-That imported function calls `then` on the given promise in JavaScript, handing it JavaScript functions that either take the `stackref` and the resolved value and call `$fulfill` with them or take the `stackref` and the error and call `$reject` with them, defined below.
+That imported function calls `then` on the given promise in JavaScript, handing it JavaScript functions that either take the `stacksegref` and the resolved value and call `$fulfill` with them or take the `stacksegref` and the error and call `$reject` with them, defined below.
 
 ```
 (import (event $extern_exn (param externref)))
 
-(func $reject (export "reject") (param $stack stackref) (param $error externref) (result externref)
+(func $reject (export "reject") (param $stack stacksegref) (param $error externref) (result externref)
   (block $finish
     (try
       (block $yielded
@@ -483,7 +475,7 @@ That imported function calls `then` on the given promise in JavaScript, handing 
         (respond $responder $awaiting ;; [externref] -> [externref]
           (stack.detach $responder $resumer $yielded)
         )
-      ) ;; $yielded : [externref stackref]
+      ) ;; $yielded : [externref stacksegref]
       (return (call $create_promise))
     catch $finished $finish
     )
@@ -505,14 +497,14 @@ Lastly, to tie it all together, here is the exported asynchronous version of the
   ) ;; $started : [externref]
   (call $main)
 )
-(func $main_async (export "main") (param $input externref) (result externref) (local $stack stackref)
+(func $main_async (export "main") (param $input externref) (result externref) (local $stack stacksegref)
   (local.set_cleared $stack (stack.create))
   (local.set_cleared $stack (stack.extend_leaf $main_rout $finished (local.get_clear $stack)))
   (call $fulfill (local.get_clear $stack) (local.get $input))
 )
 ```
-The asynchronous version essentially creates a `stackref` and initializes it to run `$main` and "return" the result with the `$finished` event.
-Then it kicks off the main program, now on its own stack, calling `$fulfill` to pass in the value that the program is waiting for as well as set up all the infrastructure for detaching the stack and creating promises as needed.
+The asynchronous version essentially creates a `stacksegref` and initializes it to run `$main` and "return" the result with the `$finished` event.
+Then it kicks off the main program, now on its own stack segment, calling `$fulfill` to pass in the value that the program is waiting for as well as set up all the infrastructure for detaching the stack and creating promises as needed.
 
 And with that, we have an efficient implementation of the async/await pattern, with the only reliance on the JS API being to register the handlers on the given promise, and with the property that each JS event runs to completion (assuming it terminates).
 
@@ -543,9 +535,9 @@ Here we summarize the new instructions/constructs introduced above and how they 
 
 #### Types
 
-* `leafref`: reference to an attached stack
+* `stackref`: reference to an attached stack
 
-* `stackref`: reference to a detached stack
+* `stacksegref`: reference to a detached stack
 
 ### Forms
 
@@ -562,25 +554,25 @@ stack.attach_clear $local
 * `stack.attach_switch`
 
 ```
-stack.attach_switch $event : [t* stackref] -> unreachable
+stack.attach_switch $event : [t* stacksegref] -> unreachable
 ```
 
 * `stack.create`
 
 ```
-stack.create : [] -> [stackref]
+stack.create : [] -> [stacksegref]
 ```
 
 * `stack.extend`
 
 ```
-stack.extend $rout : [t* stackref] -> [stackref]
+stack.extend $rout : [t* stacksegref] -> [stacksegref]
 ```
 
 * `stack.extend_leaf`
 
 ```
-stack.extend_leaf $rout $event? : [ti* stackref] -> [stackref]
+stack.extend_leaf $rout $event? : [ti* stacksegref] -> [stacksegref]
 ```
 
 * `stack_detach`
@@ -598,13 +590,13 @@ stack.start : [] -> unreachable
 * `stack.switch`
 
 ```
-stack.switch $event : [t* leafref] -> unreachable
+stack.switch $event : [t* stackref] -> unreachable
 ```
 
 * `stack.switch_call`
 
 ```
-stack.switch_call $func $event : [ti* leafref] -> unreachable
+stack.switch_call $func $event : [ti* stackref] -> unreachable
 ```
 
 ### Linear Types
@@ -677,9 +669,9 @@ There are three prior proposals-of-sorts on this topic, each of which had signif
 2. [Ross Tate's primer on low-level stack primitives](https://github.com/WebAssembly/exception-handling/issues/105) inspired our considerations for stack walking
 3. [Alon Zakai's and Ingvar Stepanyan's proposal for await](https://github.com/WebAssembly/design/issues/1345) inspired our attention to host needs regarding *attached* stacks
 
-One major difference between this proposal and all priors is our introduction of `leafref`.
+One major difference between this proposal and all priors is our introduction of `stackref`.
 All prior proposals would require most applications to use a stack walk to switch between stacks.
-But looking at related systems, we found that `leafref` enabled a much more efficient stack-switching mechanism for applications more centered around cooperative multi-tasking.
+But looking at related systems, we found that `stackref` enabled a much more efficient stack-switching mechanism for applications more centered around cooperative multi-tasking.
 
 Another major difference is our use of linear types.
 Each prior proposal implicitly relied on automatic memory management (and finalizers) to clean up stacks.
@@ -699,14 +691,14 @@ This is not to say this bundling is a fault in the design of WebAssembly, since 
 
 ### What are the key dependencies?
 
-The entire proposal is dependent on [exception handling](https://github.com/WebAssembly/exception-handling/), and the `stackref` portion is dependent on stack inspection.
+The entire proposal is dependent on [exception handling](https://github.com/WebAssembly/exception-handling/), and the `stacksegref` portion is dependent on stack inspection.
 There is no dependency on [garbage collection](https://github.com/WebAssembly/exception-handling/), though garbage collection would have to be amended to accommodate linear types.
 
 ### What are the implications for JavaScript and browser interoperability?
 
 This proposal was designed to not introduce any significant complications with JavaScript interoperability.
 Browsers already need to deal with computations being suspended midflight with their stacks put aside until later due to preemptive multi-tasking; this proposal just enables that suspension to occur (cooperatively) within a thread.
-Yes, that includes switching between stacks while processing a message on the event loop, but by not providing a way to create a `leafref` out of thin air, (and presumably by not allowing stacks to be passed within messages to other threads,) the design ensures that all these stacks are anchored to the event loop.
+Yes, that includes switching between stacks while processing a message on the event loop, but by not providing a way to create a `stackref` out of thin air, (and presumably by not allowing stacks to be passed within messages to other threads,) the design ensures that all these stacks are anchored to the event loop.
 As such, there is no way to use this proposal to somehow escape the event loop.
 
 Of course, just like JavaScript programs can run an infinite while loop, WebAssembly programs can switch between stacks infinitely.
