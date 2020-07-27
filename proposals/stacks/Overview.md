@@ -130,7 +130,7 @@ Because stack references are linear values, the stack is cleaned up by the engin
 (The stack itself might contain references to other stacks within its stack frames, so this might proceed recursively.)
 Unlike other memory management however, linearity enables this process to be done at a deterministic point in the execution, so systems that are sensitive to memory or timing can be ensured to have consistent behavior.
 
-Note that both `$resume_thread` and `$complete_work` ~~are~~ should be very simple.
+Note that both `$resume_thread` and `$complete_work` are very simple.
 As such, `stack.switch_call` for these functions does not actually need to be implemented with a true function call.
 Rather, these functions can be thought of as specifying, in a safe manner, the bookkeeping that should be done *during* the stack switch.
 
@@ -526,7 +526,7 @@ So instead here we demonstrate how stack inspection can be used to implement tag
 
 ## Summary
 
-This proposal outlines a suite of features that can be used to implement various patterns of non-sequential control flow: coroutines (both symmetric and asymmetric), support for asynchronous I/O, yield-style generators and many more.
+This proposal outlines a suite of features that can be used to implement various patterns of non-sequential control flow: coroutines (both symmetric and asymmetric), support for asynchronous I/O, delimited continuations and many more.
 
 The key abstractions revolve around the concept of a stack as a manageable entity and switching control between stacks.
 
@@ -536,7 +536,10 @@ In order to support these, we identify two main gaps in the WebAssembly architec
 
 ## Appendix: Listing of new features
 
-The features described can be categorized into different areas: support for linear types, support for stack inspection and support for stack switching. Although stack switching depends on the former two, they are potentially separable as linear type operations and stack inspection have other applications.
+The features core to this proposal are those directly supporting first-class stacks.
+However, those features rely on support for linear types and stack inspection.
+Linear types and stack inspection each have utility beyond first-class stacks and so might be better factored out into separate proposals that would consider how best to design their features in a broader context.
+Here we summarize the new instructions/constructs introduced above and how they fall into these three categories.
 
 ### Linear types
 
