@@ -532,8 +532,6 @@ The key abstractions revolve around the concept of a stack as a manageable entit
 
 In order to support these, we identify two main gaps in the WebAssembly architecture: support for stack inspections and support for linearly typed variables. We explicate them here to the extent necessary for our primary use-case; but they deserve independent proposals as they have other applications.
 
-
-
 ## Appendix: Listing of new features
 
 The features core to this proposal are those directly supporting first-class stacks.
@@ -541,97 +539,26 @@ However, those features rely on support for linear types and stack inspection.
 Linear types and stack inspection each have utility beyond first-class stacks and so might be better factored out into separate proposals that would consider how best to design their features in a broader context.
 Here we summarize the new instructions/constructs introduced above and how they fall into these three categories.
 
-### Linear types
+### First-Class Stacks
 
-These instructions are used to support linearly typed variables; they generally combine a uniqueness requirement with atomic access to memory.
+#### Types
 
+* `leafref`: reference to an attached stack
 
-* `global.get_clear`
+* `stackref`: reference to a detached stack
 
-`global.get_clear` accesses a global memory location and sets the location to null after accessing the value.
+### Forms
 
-```
-global.get_clear $global : [] -> [t]
-```
-
-* `global.set_cleared`
-
-`global.set_cleared` sets a global variable to the value on the stack; a trap results if the global memory was not null at the start of the operation.
-
-```
-global.set_cleared $global : [t] -> []
-```
-
-* `local.get_clear`
-
-`local.get_clear` accesses a local variable and sets the variable to null after accessing the value.
-
-```
-local.get_clear $local : [] -> [t]
-```
-
-* `local.set_cleared`
-
-`local.set_cleared` sets a local variable to the value on the stack; a trap results if the variable was not null at the start of the operation.
-
-```
-local.set_cleared $local : [t] -> []
-```
-
-* `table.get_clear`
-
-
-`table.get_clear` accesses a table entry and sets the entry to null after accessing the value.
-
-```
-table.get_clear $table : [i32] -> [t]
-```
-
-* `table.set_cleared`
-
-`table.set_cleared` sets a table entry to the value on the stack; a trap results if the table entry was not null at the start of the operation.
-
-```
-table.set_cleared $table : [i32 t] -> []
-```
-
-### Stack inspection
-
-We list only a few of the features that we would expect from a complete suite of operations for stack inspection.
-
-* `inquire`
-
-`inquire` searches the stack for a handler for a given call tag and invokes that handler with the additional arguments provided.
-
-```
-inquire $call_tag : [ti*] -> [to*]
-```
-
-* `respond`
-
-The `respond` form establishes a handler for a given call tag.
-
-```
-respond $label ins* end
-```
-
-### Stack Management
-
-#### types
-
-* `leafRef`
-
-* `stackRef`
+* `rout`: variant of `func` using `stack.start`
 
 #### Instructions
-
-
 
 * `stack.attach_clear`
 
 ```
 stack.attach_clear $local
 ```
+
 * `stack.attach_switch`
 
 ```
@@ -662,7 +589,11 @@ stack.extend_leaf $rout $event? : [ti* stackref] -> [stackref]
 stack.detach $responder $rout $label : [ti* tl*] -> unreachable
 ```
 
-* `stack.start`
+* `stack.start` (usable only in specific locations within a `rout`)
+
+```
+stack.start : [] -> unreachable
+```
 
 * `stack.switch`
 
@@ -676,14 +607,68 @@ stack.switch $event : [t* leafref] -> unreachable
 stack.switch_call $func $event : [ti* leafref] -> unreachable
 ```
 
-### New forms
+### Linear Types
 
-* `rout` function
+These instructions are used to support linear types.
+They all either clear (i.e. set to `null`) a store after getting its value, or check that a store is cleared before setting it to a value.
 
+* `global.get_clear`
 
+```
+global.get_clear $global : [] -> [t]
+```
 
+* `global.set_cleared`
 
-## Appendix: FAQ Frequently Asked Questions (FAQ)
+```
+global.set_cleared $global : [t] -> []
+```
+
+* `local.get_clear`
+
+```
+local.get_clear $local : [] -> [t]
+```
+
+* `local.set_cleared`
+
+```
+local.set_cleared $local : [t] -> []
+```
+
+* `table.get_clear`
+
+```
+table.get_clear $table : [i32] -> [t]
+```
+
+* `table.set_cleared`
+
+```
+table.set_cleared $table : [i32 t] -> []
+```
+
+### Stack Inspection
+
+We list only a few of the features that we would need from a complete suite of operations for stack inspection.
+
+* `inquire`
+
+`inquire` searches the stack for a handler for a given call tag and invokes that handler with the additional arguments provided.
+
+```
+inquire $call_tag : [ti*] -> [to*]
+```
+
+* `respond`
+
+The `respond` form establishes a handler for a given call tag.
+
+```
+respond $label instr* end
+```
+
+## Appendix: Frequently Asked Questions (FAQ)
 
 ### How does this relate to other proposals?
 
