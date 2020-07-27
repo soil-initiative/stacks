@@ -328,7 +328,7 @@ But sometimes a *segment* of a stack needs to be *detached* so that it can be sa
 In addition to `stackref`, we introduce `stacksegref` for references to such sack segments.
 Our running example for sack segments will be asynchronous I/O, in which its useful to detach the portion of the stack belonging to the WebAssembly application at hand so that it can be run later after an asynchronous action has completed.
 
-### Stack-Segment Creation
+### Creating Stack Segments
 
 The proposal never lets one arbitrarily break a stack apart into stack segments.
 Instead, one creates stack segments that they can attach to and detach from the stacks.
@@ -350,37 +350,22 @@ where `$rout` is a `rout (param ti*) (result to*)` and `$event` (if specified) i
 Note that this instruction consumes and produces a `stacksegref`.
 This is because, like `stackref`, the `stacksegref` type is linear.
 
-### Stack Composition
+### Attaching Stack Segments
 
-Because a `stacksegref` is detached, we can compose it with a stack or a stack segment.
-For the latter, we generalize `rout` a bit.
-In particular, in place of `stack.start`, we allow a `rout` to alternatively use the following special instruction:
-```
-stack.attach_clear $local
-```
-where `$local` is a local variable of type `stacksegref`.
-This instruction indicates to initially configure the `rout` to have the `stacksegref` in the local variable be attached (and clears the content of the variable).
-So any event received by the `rout` goes to the leaf of the given `stacksegref`, and escaping events thrown in the given `stacksegref` propagate to the `rout`.
+In this proposal, a stack is not necessarily a continuous block of memory.
+Instead, a stack is a number of blocks of memory that have been chained together, with special frames for transferring control from a child block to its parent when the child has completed (i.e. the function at the root returns).
+This proposal abstracts these implementation details away, giving engines the freedom to allocate and move around these blocks of memory as they see fit.
+For example, if a function call were to require more space than the current block has allotted, the engine can chose to expand the size of the current block, allocate a new block with the current block as its parent and execute the call there, or initiate an out-of-stack-space error.
 
-As an example, the following illustrates how to compose two `stacksegref`s together:
-```
-(rout $attach_rout (param $inner stacksegref)
-  (stack.attach_clear $inner)
-)
-(func $compose (param $outer stacksegref) (param $inner stacksegref) (result stacksegref)
-  (stack.extend_leaf $attach_rout (local.get_clear $inner) (local.get_clear $outer))
-)
-```
-
-We can also attach a `stacksegref` to the *current* stack.
-This is done using the following instruction:
+A stack segment is similarly a chain of these memory blocks, but one with no designated parent.
+One can attach a stack segment to the current stack, thereby joining their chains together, with the following instruction:
 ```
 stack.attach_switch $event : [t* stacksegref] -> unreachable
 ```
-where the specified event `$event : [t*]` is used to transfer control to the leaf of the given `stacksegref` after attaching it.
-This will be particularly useful for resuming computation on a `stacksegref` that was saved earlier using the following detaching process.
+where the specified event `$event : [t*]` is used to transfer control to the leaf of the newly combined chain (which is the leaf of the stack segment).
+This is particularly intended for resuming computation on a `stacksegref` that was saved earlier using the following detaching process.
 
-### Stack Decomposition
+### Detaching Stack Segments
 
 For detaching stack segments, we expand upon stack inspection, i.e. the first phase of two-phase exception handling.
 We describe stack inspection in more detail below, but in short one inspects the stack with the instruction
@@ -545,12 +530,6 @@ Here we summarize the new instructions/constructs introduced above and how they 
 
 #### Instructions
 
-* `stack.attach_clear`
-
-```
-stack.attach_clear $local
-```
-
 * `stack.attach_switch`
 
 ```
@@ -575,7 +554,7 @@ stack.extend $rout : [t* stacksegref] -> [stacksegref]
 stack.extend_leaf $rout $event? : [ti* stacksegref] -> [stacksegref]
 ```
 
-* `stack_detach`
+* `stack.detach`
 
 ```
 stack.detach $responder $rout $label : [ti* tl*] -> unreachable
