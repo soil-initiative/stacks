@@ -190,9 +190,15 @@ The following is an example `rout` for a lightweight thread:
 A `rout` is similar to a `func` but with one critical difference: the first instructions of the body must be instructions like `block` and `try` that do nothing besides set up control flow, followed by `stack.start`.
 This sets up a stack frame that is awaiting an event and set to handle that event.
 
-The instruction `stack.extend $rout $event? : [ti* stackref] -> [stackref]`, where `$rout` is a `rout (param ti*) (result to*)` and `$event` (if specified) is an `event (param to*)`, extends the given stack with the frame for `$rout` with the given values as its arguments.
-The resulting stack is waiting at the instruction `stack.start : [] -> unreachable` for an event.
-(`stack.start` is only usable at the near-start of a `rout`.)
+To add a `rout` stack-frame to a stack, one uses the following instruction:
+```
+stack.extend $rout $event? : [ti* stackref] -> [stackref]
+```
+where `$rout` is a `rout (param ti*) (result to*)` and `$event` (if specified) is an `event (param to*)`, extends the given stack with the frame for `$rout` with the given values as its arguments.
+The resulting stack is waiting for an event at the following special instruction that is only usable at the near-start of a `rout`:
+```
+stack.start : [] -> unreachable
+```
 If an `$event` is specified, then once the stack is switched to and handled by the `rout` such that it returns, the returned values are forwarded to the `stackref` the `rout` was attached to with the specified event.
 If no `$event` is specified, then the `rout` traps if it returns.
 Any unhandled exceptions thrown from the `rout` are forwarded to the `stackref` the `rout` was attached to.
@@ -348,7 +354,11 @@ This is because, like `stackref`, the `stacksegref` type is linear.
 
 Because a `stacksegref` is detached, we can compose it with a stack or a stack segment.
 For the latter, we generalize `rout` a bit.
-In particular, in place of `stack.start`, we allow a `rout` to use `stack.attach_clear $local`, where `$local` is a local variable of type `stacksegref`.
+In particular, in place of `stack.start`, we allow a `rout` to alternatively use the following special instruction:
+```
+stack.attach_clear $local
+```
+where `$local` is a local variable of type `stacksegref`.
 This instruction indicates to initially configure the `rout` to have the `stacksegref` in the local variable be attached (and clears the content of the variable).
 So any event received by the `rout` goes to the leaf of the given `stacksegref`, and escaping events thrown in the given `stacksegref` propagate to the `rout`.
 
@@ -363,7 +373,7 @@ As an example, the following illustrates how to compose two `stacksegref`s toget
 ```
 
 We can also attach a `stacksegref` to the *current* stack.
-This is done using the follwing instruction:
+This is done using the following instruction:
 ```
 stack.attach_switch $event : [t* stacksegref] -> unreachable
 ```
@@ -446,7 +456,7 @@ The following is one example of such a handler:
   ) ;; $finish : [externref]
 )
 ```
-The `$fulfill` function attaches the given `stacksegref` and switches to it with the `$fulfill` event, which is used to indicate that the value the stack was waiting for has been provided (as the payload of the event).
+The `$fulfill` function attaches the given `stacksegref` and switches to it with the `$fulfilled` event, which is used to indicate that the value the stack was waiting for has been provided (as the payload of the event).
 That stack might finish, indicating the `$main` program is all done, in which case it "returns" with the `$finished` event and the result of the payload.
 So `$fulfill` catches that event and returns its payload.
 However, the stack might also end up waiting for some other promise.
