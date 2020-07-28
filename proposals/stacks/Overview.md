@@ -94,13 +94,14 @@ With `stack.switch`, the stack receiving control is always responsible for stori
 However, often the stack yielding control is the one that better knows what to do with its own `stackref`.
 To support this pattern, we provide the instruction:
 ```
-stack.switch_call $func $event : [ti* stackref] -> unreachable
+stack.switch_call $func $event? : [ti* stackref] -> unreachable
 ```
-where `event $event : [to*]` and `func $func : [ti* stackref] -> [to*]`.
+where `func $func : [ti* stackref] -> [to*]` and `event $event : [to*]` (if specified).
 I.e., the event does not reference the `stackref` of the yielding stack.
 
 This instruction switches control to the given `stackref` but has the receiving stack immediately call `$func` with the given arguments *and* the `stackref` for the *yielding* stack.
 When `$func` returns, its result is then used to determine the arguments for the `$event` that the stack is waiting for.
+If no `$event` is specified, the return traps.
 
 With this we can use the following events and functions
 ```
@@ -114,18 +115,20 @@ With this we can use the following events and functions
   (local.get $work)
 )
 ```
-so that when the manager resumes a thread it can do so with simply `stack.switch_call $resume $resume_thread`, which takes care of updating the global `$manager` variable, and when a thread completes it can do so with simply `stack.switch_call $complete_work $work_completed`.
+so that when the manager resumes a thread it can do so with simply `stack.switch_call $resume_thread $resume`, which takes care of updating the global `$manager` variable, and when a thread completes it can do so with simply `stack.switch_call $complete_work $work_completed`.
 
 Note that `$complete_work` implicitly drops the given `stackref`.
-
 Because stack references are linear values, the stack is cleaned up by the engine once the stack frame it is stored in is cleaned up, so `$complete_work` implicitly performs this clean up before returning.
 (The stack itself might contain references to other stacks within its stack frames, so this might proceed recursively.)
 Unlike other memory management however, linearity enables this process to be done at a deterministic point in the execution, so systems that are sensitive to memory or timing can be ensured to have consistent behavior.
+This pattern is common, so we include the following instruction as a shorthand for switching and dropping the yielding stack (so that `$event` just has payload `[t*]`):
+```
+stack.switch_drop $event : [t* stackref] -> unreachable
+```
 
 Note that both `$resume_thread` and `$complete_work` are very simple.
 As such, `stack.switch_call` for these functions does not actually need to be implemented with a true function call.
 Rather, these functions can be thought of as specifying, in a safe manner, the bookkeeping that should be done *during* the stack switch.
-Conceptually, the call should always be inlined, though there is no way to force that implementation in a high-level semantics.
 
 ### Stack Creation
 
@@ -165,9 +168,6 @@ The following is an example `rout` for a lightweight thread:
 (event $abort : [stacksegref])
 (event $thread_aborted : [])
 (func $do_work (param $task) (result $product) ...)
-(func $finish_aborting (param $thread stackref)
-  ;; implicitly cleanup the thread stack now that we're done with it
-)
 
 (rout $thread_rout (param $id i32) (param $input $task) (local $output $product)
   (block $aborted
@@ -179,11 +179,11 @@ The following is an example `rout` for a lightweight thread:
         )
       ) ;; $resumed
       (local.set $output (call $do_work (local.get $input))
-      (stack.switch_call $work_completed $complete_work (local.get $output) (global.get_clear $manager))
+      (stack.switch_drop $work_completed (local.get $output) (global.get_clear $manager))
     catch $abort $aborted
     )
   ) ;; $aborted : [stackref]
-  (stack.switch_call $thread_aborted $finish_aborting)
+  (stack.switch_drop $thread_aborted)
 )
 ```
 
@@ -257,7 +257,7 @@ In our example, results are never null (i.e. null indicates the thread has not c
       (block $completed
         (block $yielded
           (try
-            (stack.switch_call $resume $resume_thread (table.get_clear $thread_pool (global.get $current)))
+            (stack.switch_call $resume_thread $resume (table.get_clear $thread_pool (global.get $current)))
           catch $thread_yielded $yielded
           catch $work_completed $completed
           )
@@ -321,200 +321,172 @@ We emphasize that this is not the only way this can be done&mdash;the instructio
 
 And with that, we have efficient lightweight threads without any stack walking (except to cleanup/unwind stacks) or any cyclic garbage collection or reference counting.
 
-## Design: Stack Segments
+## Design: Composable Stacks
 
-So far all stacks have been *attached*, meaning they have a grounding frame provided by the host and can be directly switched to via their `stackref`.
-But sometimes a *segment* of a stack needs to be *detached* so that it can be saved for later and run on a different stack.
-In addition to `stackref`, we introduce `stacksegref` for references to such sack segments.
-Our running example for sack segments will be asynchronous I/O, in which its useful to detach the portion of the stack belonging to the WebAssembly application at hand so that it can be run later after an asynchronous action has completed.
+So far each stack has been independent, but in many applications stacks are chained together to form a conceptual whole.
+In particular, if an exception is thrown at the end of this chain, the exception is propagated through the entire chain until it finds a handler.
+So although these stacks are allocated separately, they are made to appear as one stack.
+Our running example for composable stacks will be asynchronous I/O.
 
-### Stack-Segment Creation
+### Redirection
 
-The proposal never lets one arbitrarily break a stack apart into stack segments.
-Instead, one creates stack segments that they can attach to and detach from the stacks.
-Whereas we provide no instruction for creating *stacks*, since these need a grounding frame that only the host has the appropriate context to create, we do provide the following instruction for creating stack *segments*, which later can be attached to attached stacks with grounding frames:
+We provide stack composition by redirecting stack *walks*, the technique used by engines to implement features such as [exception handling](https://github.com/WebAssembly/exception-handling/) and [stack inspection](https://github.com/WebAssembly/design/issues/1356).
+We do so with the following instruction:
 ```
-stack.create : [] -> [stacksegref]
+stack.redirect $local instr* end : [ti*] -> [to*]
 ```
-This instruction introduces the type `stacksegref`, which conceptually is a pair of references to both the root and the leaf of a detached stack segment.
-The root is waiting for a `stackref` to attach the segment to.
-The leaf is set up to just forward whatever event is received to whatever the root is attached to.
-In other words, the newly created stack segment is empty, at least at the moment.
+where `local $local : stackref` and `instr* : [ti*] -> [to*]`.
+This instruction executes `instr*` but redirects an exceptions thrown therein to the `stackref` in `$local` at the time the exception reaches the `stack.redirect`.
+Stack inspections are similarly redirected.
+If `$local` is null at the relevant time, then no redirection occurs.
 
-Just like with stacks, we can extend a `stacksegref` with a `rout` to give it some application-specific functionality.
-This is done using the following instruction:
-```
-stack.extend_leaf $rout $event? : [ti* stacksegref] -> [stacksegref]
-```
-where `$rout` is a `rout (param ti*) (result to*)` and `$event` (if specified) is an `event (param to*)`, extends the given stack with the frame for `$rout` with the given values as its arguments.
-Note that this instruction consumes and produces a `stacksegref`.
-This is because, like `stackref`, the `stacksegref` type is linear.
+Given that `stack.redirect` does nothing upon entry, like `block` and `try`, it is allowed to preceed `stack.start` in a `rout`.
 
-### Stack Composition
+### Stack Inspection
 
-Because a `stacksegref` is detached, we can compose it with a stack or a stack segment.
-For the latter, we generalize `rout` a bit.
-In particular, in place of `stack.start`, we allow a `rout` to alternatively use the following special instruction:
-```
-stack.attach_clear $local
-```
-where `$local` is a local variable of type `stacksegref`.
-This instruction indicates to initially configure the `rout` to have the `stacksegref` in the local variable be attached (and clears the content of the variable).
-So any event received by the `rout` goes to the leaf of the given `stacksegref`, and escaping events thrown in the given `stacksegref` propagate to the `rout`.
+For most applications of stack inspection, one needs some form of stack inspection.
+In particular, applications typically set up the redirection in the root frame of the stack, but need the leaf frame to have some way to get and change the `stackref` being redirected to.
+This involves walking the stack (while keeping it in tact) to find the root frame and then executing relevant code to access and mutate the `$local` being used for redirection in the root frame.
 
-As an example, the following illustrates how to compose two `stacksegref`s together:
-```
-(rout $attach_rout (param $inner stacksegref)
-  (stack.attach_clear $inner)
-)
-(func $compose (param $outer stacksegref) (param $inner stacksegref) (result stacksegref)
-  (stack.extend_leaf $attach_rout (local.get_clear $inner) (local.get_clear $outer))
-)
-```
-
-We can also attach a `stacksegref` to the *current* stack.
-This is done using the following instruction:
-```
-stack.attach_switch $event : [t* stacksegref] -> unreachable
-```
-where the specified event `$event : [t*]` is used to transfer control to the leaf of the given `stacksegref` after attaching it.
-This will be particularly useful for resuming computation on a `stacksegref` that was saved earlier using the following detaching process.
-
-### Stack Decomposition
-
-For detaching stack segments, we expand upon stack inspection, i.e. the first phase of two-phase exception handling.
-We describe stack inspection in more detail below, but in short one inspects the stack with the instruction
-```
-inquire $dispatch_tag : [ti*] -> [to*]
-```
-where `$dispatch_tag` is a dispatch tag, i.e. a generalization of the function-type signature used in `call_indirect`, of type `[ti*] -> [to*]`.
-Handlers on the stack take the form of a `respond $dispatch_tag` block whose body responds to the inquiry with instructions that generate outputs matching the types specified by the dispatch tag.
-
-Normally `respond $dispatch_tag` would follow a `try` block, per standard exception handling, but in this proposal we also allow it to follow `stack.attach_clear`.
-Furthermore, when used in this manner, the body of the `respond` block can use a special `stack.detach` instruction:
-```
-stack.detach $responder $rout $label : [ti* tl*] -> unreachable
-```
-The `$responder` indicates which containing `respond $dispatch_tag` block to detach up to, where `$dispatch_tag` must have output type `[to*]`.
-The `$rout` is a `rout` of type `[ti*] -> [to*]`; it is put on the detached stack in order to handle the stack-switching event, and is configured so that its returned values provide the response for the `respond` block.
-Lastly, control is transferred to the label `$label` *outside* of the `respond` block, where `$label` has type `[tl* stacksegref]`&mdash;the final `stacksegref` is then the reference to the stack segment that was just detached.
-The unfortunate complexity of the instruction is due to the fact that the content of the current stack needs to be examined by the `$responder` in order to determine *if* the stack segment should be detached (and the `$label` specifies how), but the rest of the response must not depend on the current stack because it might be concluded after being attached to a completely different stack (so the `$rout` specifies how to conclude the response).
+Stack inspection has yet to be designed.
+It generally requires some way to functions registered with frames on the stack that have the ability to inspect and update the stack frame they are registered with.
+For now we assume we have the following instructions for stack inspection (using the [Call Tags](https://github.com/WebAssembly/call-tags) proposal):
+* `call_stack $call_tag : [ti*] -> [to*]`
+  * where `call_tag $call_tag : [ti*] -> [to*]`, specifying the inputs and outputs of the inspection
+  * looks up the stack for an `answer $call_tag` and calls it
+* `answer $call_tag instr1* within instr2* end`
+  * where `call tag $call_tag : [ti*] -> [to*]`
+  * and `instr1* : [ti*] -> [to*]`
+  * executes (and inherits the type of) `instr2*`, during which answering any `call_stack $call_tag` with `instr1*`
 
 ### Application&mdash;Async/Await
 
-Now we put the pieces together to illustrate how a program written in a synchronous style can be made asynchronous using detachable stacks.
-First, suppose the main function of the program is:
+Now we put the pieces together to illustrate how a program written in a synchronous style can be made asynchronous using stack composition.
+At a high-level, every external entry point to the WebAssembly program allocates a new internal stack to run the program on and then uses redirection to make it appear as if the program is running on the original stack.
+Whenever the program has to wait for some promise, it removes the redirection, registers the internal stack as part of a listener on the promise, and returns control to the original stack.
+When the promise resolves, the internal stack sets up a redirection to the promise's stack, and continues executing the program.
 
+First, suppose the synchronous program has the following as an entry point:
 ```
-(func $main (param externref) (result externref) ...)
+(func $entry (param f64) (result f64) ...)
 ```
-operating on `externref` for the sake of simplicity.
-Second, suppose `$main` and its callees use
+operating on `f64` for the sake of simplicity.
 
+Then the asynchronous program would have the following as the corresponding export:
 ```
-(call $await) : [externref] -> [externref]`
-```
-to extract (and possibly wait for) the value of what is conceptually a promise.
+(import (func $new_stack (result stackref)))
+(import (func $create_promise (param externref stackref) (result externref)))
+(import (func $f64_externref (param f64) (result externref)))
 
-Using this proposal, we can implement `$await` within WebAssembly:
-```
-(dispatch_tag $awaiting (param externref) (result externref))
+(event $returning (param f64))
+(event $awaiting (param externref stackref))
 
-(func $await (param $promise externref) (result externref)
-  (inquire $awaiting (local.get $promise))
+(func $entry_async (export "entry") (param $input f64) (result externref)
+  (block $returned
+    (block $awaited
+      (try
+        (stack.switch_call $entry_root (local.get $input) (call $new_stack))
+      catch $awaiting $awaited
+      catch $returning $returned
+      )
+    ) ;; [externref stackref]
+    (return (call $create_promise))
+  ) ;; [f64]
+  (call $f64_externref)
 )
 ```
-This starts a stack inspection, with the intent that it will cause the current stack segment to be detached and registered with the `externref` promise, eventually responding with the value the promise resolves to.
+Note that the first thing this function does is create a new stack (via `call $new_stack`).
+Then it switches to that new stack and calls `$entry_root` (defined below) on it.
+`$entry_root` essentially calls `$entry` (on this new stack).
+If that call completes, it switches control back to the original stack using the `$returning` event.
+`$entry_async` then catches that event and converts the returned `f64` to an `externref`.
+If on the other hand the call in `$entry_root` has to await for some promise, it switches control back to the original stack using the `$awaiting` event.
+The payload of this event is the promise to await for and the stack that is waiting for the resolution.
+`$entry_async` catches that event and calls `$create_promise` (defined below) to return the desired promise to whomever called the (asynchronous) exported "entry" function.
 
-For that to happen, an `$awaiting` handler on the stack needs to actually detach the stack segment and such.
-The following is one example of such a handler:
+The `$entry_root` function that runs on the newly created stack is defined as follows:
 ```
-(event $fulfilled (param externref))
-(event $finished (param externref))
-(import (func $create_promise (param externref stacksegref) (result externref)))
+(call_tag $await (param externref) (result externref))
+(event $resolving (param externref stackref))
 
-(rout $resumer (result externref)
-  (block $resumed
-    (try
-      stack.start
-    catch $fulfilled $resumed
-    )
-  ) ;; $resumed : [externref]
-)
-(func $fulfill (export "fulfill") (param $stack stacksegref) (param $value externref) (result externref)
-  (block $finish
-    (try
-      (block $yielded
-        (stack.attach_switch $fulfilled (local.get $value) (local.get_clear $stack))
-        (respond $responder $awaiting ;; [externref] -> [externref]
-          (stack.detach $responder $resumer $yielded)
+(func $entry_root (param $input f64) (param $stack stackref) (local $output f64)
+  (stack.redirect $stack
+    (answer $await ;; [externref] -> [externref]
+      (block $reentered
+        (try
+          (let (local $promise externref)
+            (stack.switch $awaiting (local.get $promise) (local.get_clear $stack))
+          )
+        catch $resolving $resolved
         )
-      ) ;; $yielded : [externref stacksegref]
-      (return (call $create_promise))
-    catch $finished $finish
+      ) ;; [externref stackref]
+      (local.set_cleared $stack)
+    within
+      (local.set $output (call $entry (local.get $input)))
     )
-  ) ;; $finish : [externref]
+  )
+  (stack.switch_drop $returning (local.get $output) (local.get_clear $stack))
 )
 ```
-The `$fulfill` function attaches the given `stacksegref` and switches to it with the `$fulfilled` event, which is used to indicate that the value the stack was waiting for has been provided (as the payload of the event).
-That stack might finish, indicating the `$main` program is all done, in which case it "returns" with the `$finished` event and the result of the payload.
-So `$fulfill` catches that event and returns its payload.
-However, the stack might also end up waiting for some other promise.
-In this case, `$responder` detaches the stack segment, using `$resumer` to respond with the payload of any future `$fulfill` event, and then hands off the promise and the detached stack segment to `$yielded`.
-This in turn creates a promise, returning it as the (incomplete) result of `$fulfill`, using the imported function `$create_promise`.
-That imported function calls `then` on the given promise in JavaScript, handing it JavaScript functions that either take the `stacksegref` and the resolved value and call `$fulfill` with them or take the `stacksegref` and the error and call `$reject` with them, defined below.
+The first instruction `$entry_root` really executes is the call to `$entry`.
+However, it does so `within` an `answer $await`.
+This `answer` enables `$entry` and its callees to use `call_stack $await : [externref] -> [externref]` to get (and wait for) the resolution of a promise.
+The `answer` works by switching control back to the original stack, handing it the promise and the current stack (that is still in tact).
+That `stack.switch` is configured to catch the `$resolving` event that is used to switch control back to `$entry_root`.
+The payload of this event is the `externref` value the promise resolved to along with the stack that the promise is being resolved on.
+That stack is stored in the local `$stack` variable, and the `externref` resolution is returned as the result of the `$await` inspection.
+Note that whenever control is inside the call to `$entry`, stack walks are being redirected to `$stack`.
+This ensures that any (JavaScript) exceptions that occur during this call are redirected to the appropriate original stack.
 
+All this is predicated on the existence of some imported `$create_promise : [externref, stackref] -> [externref]` function.
+This function is defined in JavaScript as follows:
 ```
-(import (event $extern_exn (param externref)))
+(promise, stack) => promise.then((x) => module_instance.resolve(x, stack),
+                                 (e) => module_instance.reject(e, stack))
+```
+which in turn calls back into the module through two exported functions that are in charge of returning control to the given stack in the appropriate manner.
 
-(func $reject (export "reject") (param $stack stacksegref) (param $error externref) (result externref)
-  (block $finish
-    (try
-      (block $yielded
-        (stack.attach_switch $extern_exn (local.get $error) (local.get_clear $stack))
-        (respond $responder $awaiting ;; [externref] -> [externref]
-          (stack.detach $responder $resumer $yielded)
-        )
-      ) ;; $yielded : [externref stacksegref]
-      (return (call $create_promise))
-    catch $finished $finish
-    )
-  ) ;; $finish : [externref]
+The "resolve" function below is used when the awaited promise resolves to a value.
+Note that it looks very similar to `$entry_main` except that it uses the provided stack, rather than a new stack, and it uses the `$resolving` event expected by the code in the `answer $await` above.
+```
+(func (export "resolve") (param $resolution externref) (param $stack stackref) (result externref)
+  (block $returned
+    (block $paused
+      (try
+        (stack.switch $resolving (local.get $resolution) (local.get $stack))
+      catch $pausing paused
+      catch $returning $returned
+      )
+    ) ;; [externref stackref]
+    (return (call $create_promise))
+  ) ;; [f64]
+  (call $f64_externref)
 )
 ```
-This is nearly identical to `$fulfill` except that it switches with the `$extern_exn` event rather than `$fulfilled`.
-Because `$extern_exn` is not handled by `$resumer`, it will be thrown as an exception on the stack.
-The intent is for `$extern_exn` to be instantiated with the event for JavaScript exceptions, so that this amounts to throwing a JavaScript exception on the stack, which is exactly what would have happened had the promise been resolved synchronously.
 
-Lastly, to tie it all together, here is the exported asynchronous version of the main program:
+The "reject" function is used with the awaited promise results in an error.
+Note that it looks very similar to "resolve"; the only difference is the event that is used to switch control.
+This event is not expected by the code in `answer $await` above, and so it causes an exception to get thrown by the corresponding `call_stack $await`, just as the synchronous code expects.
+The expectation is that `$externexn` will be instantiated with the event for JavaScript exceptions, and as such the thrown event will get handled by the code in `$entry` just like any other JavaScript exception.
 ```
-(rout $main_rout (result externref)
-  (block $started
-    (try
-      stack.start
-    catch $fulfilled $started
-    )
-  ) ;; $started : [externref]
-  (call $main)
-)
-(func $main_async (export "main") (param $input externref) (result externref) (local $stack stacksegref)
-  (local.set_cleared $stack (stack.create))
-  (local.set_cleared $stack (stack.extend_leaf $main_rout $finished (local.get_clear $stack)))
-  (call $fulfill (local.get_clear $stack) (local.get $input))
+(import $externexn (param externref))
+
+(func (export "reject") (param $error externref) (param $stack stackref) (result externref)
+  (block $returned
+    (block $paused
+      (try
+        (stack.switch $externexn (local.get $error) (local.get $stack))
+      catch $pausing paused
+      catch $returning $returned
+      )
+    ) ;; [externref stackref]
+    (return (call $create_promise))
+  ) ;; [f64]
+  (call $f64_externref)
 )
 ```
-The asynchronous version essentially creates a `stacksegref` and initializes it to run `$main` and "return" the result with the `$finished` event.
-Then it kicks off the main program, now on its own stack segment, calling `$fulfill` to pass in the value that the program is waiting for as well as set up all the infrastructure for detaching the stack and creating promises as needed.
 
 And with that, we have an efficient implementation of the async/await pattern, with the only reliance on the JS API being to register the handlers on the given promise, and with the property that each JS event runs to completion (assuming it terminates).
-
-## Design: Stack Inspection
-
-The previous example has very coarse delimiting of stacks, such that its `respond` for `stack.attach` always detaches upon the right inquiry.
-Furthermore, the stacks are always used just once.
-On the other hand, languages with tagged forms of reusable delimited continuations need the additional flexibility that `respond` blocks provide (in order to *dynamically* check tags), and they need an ability to duplicate stacks.
-We purposely do not provide a primitive for stack duplication, both because we are concerned duplicating stacks of programs not designed for such functionality could create vulnerabilities, and because the process is rather complex with many seemingly arbitrary design choices to be made such that it is unclear it can be done in a suitably agnostic manner.
-So instead here we demonstrate how stack inspection can be used to implement tagged reusable delimited continuations.
 
 ## Summary
 
@@ -537,49 +509,25 @@ Here we summarize the new instructions/constructs introduced above and how they 
 
 * `stackref`: reference to an attached stack
 
-* `stacksegref`: reference to a detached stack
-
 ### Forms
 
 * `rout`: variant of `func` using `stack.start`
 
 #### Instructions
 
-* `stack.attach_clear`
-
-```
-stack.attach_clear $local
-```
-
-* `stack.attach_switch`
-
-```
-stack.attach_switch $event : [t* stacksegref] -> unreachable
-```
-
-* `stack.create`
-
-```
-stack.create : [] -> [stacksegref]
-```
-
 * `stack.extend`
 
 ```
-stack.extend $rout : [t* stacksegref] -> [stacksegref]
+stack.extend $rout $event? : [ti* stackref] -> [stackref]
 ```
+where `rout $rout : [ti*] -> [to*]` and `event $event : [to*]` (if specified)
 
-* `stack.extend_leaf`
-
-```
-stack.extend_leaf $rout $event? : [ti* stacksegref] -> [stacksegref]
-```
-
-* `stack_detach`
+* `stack.redirect`
 
 ```
-stack.detach $responder $rout $label : [ti* tl*] -> unreachable
+stack.redirect $local instr* end : [ti*] -> [to*]
 ```
+where `local $local : stackref` and `instr* : [ti*] -> [to*]`
 
 * `stack.start` (usable only in specific locations within a `rout`)
 
@@ -592,12 +540,21 @@ stack.start : [] -> unreachable
 ```
 stack.switch $event : [t* stackref] -> unreachable
 ```
+where `event $event : [t* stackref]`
 
 * `stack.switch_call`
 
 ```
-stack.switch_call $func $event : [ti* stackref] -> unreachable
+stack.switch_call $func $event? : [ti* stackref] -> unreachable
 ```
+where `func $func : [ti* stackref] -> [to*]` and `event $event : [to*]` (if specified)
+
+* `stack.switch_drop`
+
+```
+stack.switch_drop $event : [t* stackref] -> unreachable
+```
+where `event $event : [t*]`
 
 ### Linear Types
 
@@ -642,23 +599,21 @@ table.set_cleared $table : [i32 t] -> []
 
 ### Stack Inspection
 
-We list only a few of the features that we would need from a complete suite of operations for stack inspection.
+We list only the features that we would need from a complete suite of operations for stack inspection.
 
-* `inquire`
-
-`inquire` searches the stack for a handler for a given call tag and invokes that handler with the additional arguments provided.
+* `answer`
 
 ```
-inquire $call_tag : [ti*] -> [to*]
+answer $call_tag instr1* within instr2* end : [ti2*] -> [to2*]
 ```
+where `call_tag $call_tag : [ti1*] -> [to1*]` and `instr1* : [ti1*] -> [to1*]` and `instr2* : [ti2*] -> [to2*]`
 
-* `respond`
-
-The `respond` form establishes a handler for a given call tag.
+* `call_stack`
 
 ```
-respond $label instr* end
+call_stack $call_tag : [ti*] -> [to*]
 ```
+where `call_tag $call_tag : [ti*] -> [to*]`
 
 ## Appendix: Frequently Asked Questions (FAQ)
 
