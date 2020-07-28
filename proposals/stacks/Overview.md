@@ -132,7 +132,7 @@ Rather, these functions can be thought of as specifying, in a safe manner, the b
 
 ### Stack Creation
 
-One of our invariants is that a `stackref` always references an *attached* stack.
+One of our invariants is that a `stackref` always references a *complete* stack.
 That is, if one were to walk the stack from the leaf, one would always reach a special *grounding* frame created by the host.
 This grounding frame is responsible in particular for handling traps, whether by terminating the thread executing the trapping stack or by moving to the next event in the queue or by reporting an error and so on.
 The point is, only the host can create grounding frames, and the semantics of these grounding frames depend on context, so we provide no means to create stack references out of thin air.
@@ -156,7 +156,7 @@ As such, the module imports a `$new_stack` function from the host, which it uses
 )
 ```
 
-The `$spawn_thread` function finds an unused identifier for the thread, uses the imported `$new_stack` function to create a new attached stack, then *extends* that stack with a custom frame, and finally adds the thread to the pool, returning its identifier.
+The `$spawn_thread` function finds an unused identifier for the thread, uses the imported `$new_stack` function to create a new complete stack, then *extends* that stack with a custom frame, and finally adds the thread to the pool, returning its identifier.
 
 The extension step is critical.
 Realize that all the imported `$new_stack` function does is provide a `stackref` for some new stack, one that is conceptually blank besides its grounding frame.
@@ -507,7 +507,7 @@ Here we summarize the new instructions/constructs introduced above and how they 
 
 #### Types
 
-* `stackref`: reference to an attached stack
+* `stackref`: reference to a complete stack
 
 ### Forms
 
@@ -622,11 +622,11 @@ where `call_tag $call_tag : [ti*] -> [to*]`
 There are three prior proposals-of-sorts on this topic, each of which had significant influence on the design we developed:
 1. [Andreas Rossberg's presentation at the Feb 2020 In-Person CG Meeting](https://github.com/WebAssembly/meetings/blob/master/main/2020/presentations/2020-02-rossberg-continuations.pdf) inspired our heavy use of events
 2. [Ross Tate's primer on low-level stack primitives](https://github.com/WebAssembly/exception-handling/issues/105) inspired our considerations for stack walking
-3. [Alon Zakai's and Ingvar Stepanyan's proposal for await](https://github.com/WebAssembly/design/issues/1345) inspired our attention to host needs regarding *attached* stacks
+3. [Alon Zakai's and Ingvar Stepanyan's proposal for await](https://github.com/WebAssembly/design/issues/1345) inspired our attention to host needs regarding *grounding* frames
 
-One major difference between this proposal and all priors is our introduction of `stackref`.
-All prior proposals would require most applications to use a stack walk to switch between stacks.
-But looking at related systems, we found that `stackref` enabled a much more efficient stack-switching mechanism for applications more centered around cooperative multi-tasking.
+One major difference between this proposal and all priors is our `stackref` values being *complete* stacks.
+This enables us to quickly switch between stacks, whereas all prior proposals required employing a stack walk to first detach a stack *slice* and then attaching a different stack slice.
+Looking at related systems, we found that `stackref` enabled a much more efficient stack-switching mechanism for applications more centered around cooperative multi-tasking, and instead broke down the process of detaching and attaching stack slices into the combination of stack inspection and stack-walk redirection.
 
 Another major difference is our use of linear types.
 Each prior proposal implicitly relied on automatic memory management (and finalizers) to clean up stacks.
@@ -653,7 +653,7 @@ There is no dependency on [garbage collection](https://github.com/WebAssembly/ex
 
 This proposal was designed to not introduce any significant complications with JavaScript interoperability.
 Browsers already need to deal with computations being suspended midflight with their stacks put aside until later due to preemptive multi-tasking; this proposal just enables that suspension to occur (cooperatively) within a thread.
-Yes, that includes switching between stacks while processing a message on the event loop, but by not providing a way to create a `stackref` out of thin air, (and presumably by not allowing stacks to be passed within messages to other threads,) the design ensures that all these stacks are anchored to the event loop.
+Yes, that includes switching between stacks while processing a message on the event loop, but by not providing a way to create a `stackref` out of thin air, (and presumably by not allowing stacks to be passed within messages to other threads,) the design ensures that all these stacks are grounded to the event loop.
 As such, there is no way to use this proposal to somehow escape the event loop.
 
 Of course, just like JavaScript programs can run an infinite while loop, WebAssembly programs can switch between stacks infinitely.
