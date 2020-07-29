@@ -17,7 +17,7 @@ Although important, we do not directly provide the mechanisms necessary to excha
 Instead we provide the primitives that&mdash;in conjunction with other functionality WebAssembly already provides&mdash;enables the language implementer to develop their own mechanisms.
 We do, however, establish the framework for communicating the status of a coroutine when switching to another stack. That status must encode whether the coroutine is terminating and *may* encode values as part of that event.
 
-In this document we explain the main aspects of the design for *multiple stacks* and illustrate them in the context of a few applications, including how to provide cooperative lightweight threads, how to implement asynchronous I/O, and how one can support delimited continuations.
+In this document we explain the main aspects of the design for *first-class stacks* and illustrate them in the context of a few applications, including how to provide cooperative lightweight threads, how to implement asynchronous I/O, and how one can support multi-shot tagged delimited continuations.
 
 ## Design: Multiple Stacks
 
@@ -165,7 +165,7 @@ In order to give this stack some functionality specific to the application at ha
 Because this concept is inspired by coroutines and typically is used to set up the root of the stack, we call this special kind of function a `rout`.
 The following is an example `rout` for a lightweight thread:
 ```
-(event $abort : [stacksegref])
+(event $abort : [stackref])
 (event $thread_aborted : [])
 (func $do_work (param $task) (result $product) ...)
 
@@ -203,7 +203,7 @@ If an `$event` is specified, then once the stack is switched to and handled by t
 If no `$event` is specified, then the `rout` traps if it returns.
 Any unhandled exceptions thrown from the `rout` are forwarded to the `stackref` the `rout` was attached to.
 
-So if one calls an imported function `$new_stack : [] -> [stacksegref]` and then executes `(stack.extend $thread_rout (i32.const 237) $work)`, that altogether creates a new stack that is
+So if one calls an imported function `$new_stack : [] -> [stackref]` and then executes `(stack.extend $thread_rout (i32.const 237) $work)`, that altogether creates a new stack that is
 1. waiting for its first `$resume` event,
 2. upon which it will call `$do_thread_work` with the given `$work`,
 3. which in turn can yield control to the thread manager via `(call $yield_current_thread)` (defined above),
@@ -646,7 +646,7 @@ This is not to say this bundling is a fault in the design of WebAssembly, since 
 
 ### What are the key dependencies?
 
-The entire proposal is dependent on [exception handling](https://github.com/WebAssembly/exception-handling/), and the `stacksegref` portion is dependent on stack inspection.
+The entire proposal is dependent on [exception handling](https://github.com/WebAssembly/exception-handling/), and the composable-stacks portion is dependent on stack inspection.
 There is no dependency on [garbage collection](https://github.com/WebAssembly/exception-handling/), though garbage collection would have to be amended to accommodate linear types.
 
 ### What are the implications for JavaScript and browser interoperability?
