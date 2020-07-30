@@ -389,9 +389,9 @@ Then the asynchronous program would have the following as the corresponding expo
       catch $awaiting $awaited
       catch $returning $returned
       )
-    ) ;; [externref stackref]
+    ) ;; $awaited : [externref stackref]
     (return (call $create_promise))
-  ) ;; [f64]
+  ) ;; $returned : [f64]
   (call $f64_externref)
 )
 ```
@@ -406,19 +406,27 @@ The payload of this event is the promise to await for and the stack that is wait
 
 The `$entry_root` function that runs on the newly created stack is defined as follows:
 ```
+(import $externexn (param externref))
+
 (call_tag $await (param externref) (result externref))
 (event $resolving (param externref stackref))
+(event $rejecting (param externref stackref))
 
 (func $entry_root (param $input f64) (param $stack stackref) (local $output f64)
   (stack.redirect $stack
     (answer $await ;; [externref] -> [externref]
       (block $resolved
-        (try
-          (let (local $promise externref)
-            (stack.switch $awaiting (local.get $promise) (local.get_clear $stack))
+        (block $rejected
+          (try
+            (let (local $promise externref)
+              (stack.switch $awaiting (local.get $promise) (local.get_clear $stack))
+            )
+          catch $resolving $resolved
+          catch $rejecting $rejected
           )
-        catch $resolving $resolved
-        )
+        ) ;; $rejected : [externref stackref]
+        (local.set_cleared $stack)
+        (throw $externexn)
       ) ;; $resolved : [externref stackref]
       (local.set_cleared $stack)
     within
@@ -435,6 +443,7 @@ The `answer` works by switching control back to the original stack, handing it t
 That `stack.switch` is configured to catch the `$resolving` event that is used to switch control back to `$entry_root`.
 The payload of this event is the `externref` value the promise resolved to along with the stack that the promise is being resolved on.
 That stack is stored in the local `$stack` variable, and the `externref` resolution is returned as the result of the `$await` inspection.
+If instead the `$rejecting` event is caught, then the local `$stack` variable is similarly stored, and the contain `externref` error-value is thrown as an `$externref`, which is intended to be the event for specifically JavaScript exceptions.
 Note that whenever control is inside the call to `$entry`, stack walks are being redirected to `$stack`.
 This ensures that any (JavaScript) exceptions that occur during this call are redirected to the appropriate original stack.
 
@@ -451,37 +460,36 @@ Note that it looks very similar to `$entry_main` except that it uses the provide
 ```
 (func (export "resolve") (param $resolution externref) (param $stack stackref) (result externref)
   (block $returned
-    (block $paused
+    (block $awaited
       (try
-        (stack.switch $resolving (local.get $resolution) (local.get $stack))
-      catch $pausing paused
+        (stack.switch $resolving (local.get $resolution) (local.get_clear $stack))
+      catch $awaiting $awaited
       catch $returning $returned
       )
-    ) ;; [externref stackref]
+    ) ;; $awaited : [externref stackref]
     (return (call $create_promise))
-  ) ;; [f64]
+  ) ;; $returned : [f64]
   (call $f64_externref)
 )
 ```
 
 The "reject" function is used with the awaited promise results in an error.
 Note that it looks very similar to "resolve"; the only difference is the event that is used to switch control.
-This event is not expected by the code in `answer $await` above, and so it causes an exception to get thrown by the corresponding `call_stack $await`, just as the synchronous code expects.
-The expectation is that `$externexn` will be instantiated with the event for JavaScript exceptions, and as such the thrown event will get handled by the code in `$entry` just like any other JavaScript exception.
+The `answer $await` above will turn the given `$rejecting` event into an `$externexn` exception.
+This is intended to be instantiated with whatever event represents specifically JavaScript exceptions.
+As such, the thrown exception will get handled by the code in `$entry` just like any other JavaScript exception.
 ```
-(import $externexn (param externref))
-
 (func (export "reject") (param $error externref) (param $stack stackref) (result externref)
   (block $returned
-    (block $paused
+    (block $awaited
       (try
-        (stack.switch $externexn (local.get $error) (local.get $stack))
-      catch $pausing paused
+        (stack.switch $rejecting (local.get $error) (local.get_clear $stack))
+      catch $awaiting $awaited
       catch $returning $returned
       )
-    ) ;; [externref stackref]
+    ) ;; $awaited : [externref stackref]
     (return (call $create_promise))
-  ) ;; [f64]
+  ) ;; $returned : [f64]
   (call $f64_externref)
 )
 ```
