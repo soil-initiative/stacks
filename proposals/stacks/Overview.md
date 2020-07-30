@@ -412,14 +412,14 @@ The `$entry_root` function that runs on the newly created stack is defined as fo
 (func $entry_root (param $input f64) (param $stack stackref) (local $output f64)
   (stack.redirect $stack
     (answer $await ;; [externref] -> [externref]
-      (block $reentered
+      (block $resolved
         (try
           (let (local $promise externref)
             (stack.switch $awaiting (local.get $promise) (local.get_clear $stack))
           )
         catch $resolving $resolved
         )
-      ) ;; [externref stackref]
+      ) ;; $resolved : [externref stackref]
       (local.set_cleared $stack)
     within
       (local.set $output (call $entry (local.get $input)))
