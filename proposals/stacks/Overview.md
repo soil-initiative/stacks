@@ -506,7 +506,7 @@ We could more generally have `stack.redirect` specify a computation to run to de
 stack.redirect_to instr1* then instr2* within instr3* end : [ti*] -> [to*]
 ```
 * where `instr1* : [] -> [stackref]` specifies the instructions to run to determine where to redirect to
-* where `instr2* : [stackref] -> []` specifies the instructions to run after the redirection as done (returning the `stackref` that was redirected to)
+* where `instr2* : [stackref] -> []` specifies the instructions to run after the redirection is done (returning the `stackref` that was redirected to)
 * and `instr3*` : [ti*] -> [to*]` are the instructions whose stack walks get redirected.
 
 Using this, `stack.redirect $local instr* end` is the special case `stack.redirect_to (local.get_clear $local) then (local.set_cleared $local) within instr* end`.
@@ -533,7 +533,7 @@ This means that, rather than having to do a stack inspection to update who the a
 )
 ```
 
-Then rather than having programs await promises by performaing `call_stack $await`, we instead have them simply perform `call $await` using the following function:
+Then rather than having programs await promises by performing `call_stack $await`, we instead have them simply perform `call $await` using the following function:
 ```
 (func $await (param $promise externref) (result externref)
   (block $resolved
@@ -606,7 +606,7 @@ Lastly, we update the exported functions to use the new convention, namely stori
   (call $f64_externref)
 )
 ```
-and the revise the imported function `$create_promise : [externref] -> [externref]` similarly as follows:
+and then revise the imported function `$create_promise : [externref] -> [externref]` similarly as follows:
 ```
 (promise) => promise.then((x) => module_instance.resolve(x),
                           (e) => module_instance.reject(e))
