@@ -496,10 +496,8 @@ As such, the thrown exception will get handled by the code in `$entry` just like
 
 And with that, we have an efficient implementation of the async/await pattern, with the only reliance on the JS API being to register the handlers on the given promise, and with the property that each JS event runs to completion (assuming it terminates).
 
-### Variant
+### Generalized Variant
 
-Many WebAssembly modules are compiled with the assumption that only one stack is live in any particular instance of the module at a time.
-For this common case, there is a more efficient way to support asynchronous I/O if we consider a variant of `stack.redirect`.
 Currently, `stack.redirect` specifies a local variable to use to determine where to redirect to when a stack walk occurs.
 We could more generally have `stack.redirect` specify a computation to run to determine where to redirect to, as follows:
 ```
@@ -507,112 +505,11 @@ stack.redirect_to instr1* then instr2* within instr3* end : [ti*] -> [to*]
 ```
 * where `instr1* : [] -> [stackref]` specifies the instructions to run to determine where to redirect to
 * where `instr2* : [stackref] -> []` specifies the instructions to run after the redirection is done (returning the `stackref` that was redirected to)
-* and `instr3*` : [ti*] -> [to*]` are the instructions whose stack walks get redirected.
+* and `instr3* : [ti*] -> [to*]` are the instructions whose stack walks get redirected.
 
 Using this, `stack.redirect $local instr* end` is the special case `stack.redirect_to (local.get_clear $local) then (local.set_cleared $local) within instr* end`.
 But now we can support other redirection patterns, such as getting/setting a mutable field of some heap reference, getting/setting an entry in a table, or getting/setting a *global* variable.
-This last case is potentially quite useful to efficiently support asynchronous I/O.
-
-If we are willing to assume we have a single live stack, then we can use global variables to store the relevant "host" stack and "application" stack:
-```
-(global $hoststack stackref)
-(global $appstack stackref)
-```
-This means that, rather than having to do a stack inspection to update who the application stack should redirect to, we can use `stack.redirect_to` to make the application stack just always redirect to whatever stack is stored in `$hoststack`:
-```
-(func $entry_root (param $input f64) (param $stack stackref) (local $output f64)
-  (global.set_cleared $hoststack (local.get $stack))
-  (stack.redirect_to
-    (global.get_clear $hoststack)
-  then
-    (global.set_clear $hoststack)
-  within
-    (local.set $output (call $entry (local.get $input)))
-  )
-  (stack.switch_drop $returning (local.get $output) (global.get_clear $hoststack))
-)
-```
-
-Then rather than having programs await promises by performing `call_stack $await`, we instead have them simply perform `call $await` using the following function:
-```
-(func $await (param $promise externref) (result externref)
-  (block $resolved
-    (block $rejected
-      (try
-        (stack.switch $awaiting (local.get $promise) (global.get_clear $hoststack))
-      catch $resolving $resolved
-      catch $rejecting $rejected
-      )
-    ) ;; $rejected : [externref stackref]
-    (global.set_cleared $hoststack)
-    (throw $externexn)
-  ) ;; $resolved : [externref stackref]
-  (global.set_cleared $hoststack)
-)
-```
-This simply transfers control back to the `$hoststack`, but with the `$awaiting` event rather than the `$returning` event, and then restores the `$hoststack` variable when control as transferred back.
-This is much faster than before because it no longer involves a stack inspection.
-
-Lastly, we update the exported functions to use the new convention, namely storing the awaiting stack in the `$appstack` global variable rather than as part of the continuation:
-```
-(import (func $new_stack (result stackref)))
-(import (func $create_promise (param externref) (result externref)))
-(import (func $f64_externref (param f64) (result externref)))
-
-(event $returning (param f64))
-(event $awaiting (param externref stackref))
-
-(func $entry_async (export "entry") (param $input f64) (result externref)
-  (block $returned
-    (block $awaited
-      (try
-        (stack.switch_call $entry_root (local.get $input) (call $new_stack))
-      catch $awaiting $awaited
-      catch $returning $returned
-      )
-    ) ;; $awaited : [externref stackref]
-    (global.set_cleared $appstack)
-    (return (call $create_promise))
-  ) ;; $returned : [f64]
-  (call $f64_externref)
-)
-
-(func (export "resolve") (param $resolution externref) (result externref)
-  (block $returned
-    (block $awaited
-      (try
-        (stack.switch $resolving (local.get $resolution) (global.get_clear $appstack))
-      catch $awaiting $awaited
-      catch $returning $returned
-      )
-    ) ;; $awaited : [externref stackref]
-    (global.set_cleared $appstack)
-    (return (call $create_promise))
-  ) ;; $returned : [f64]
-  (call $f64_externref)
-)
-
-(func (export "reject") (param $error externref) (result externref)
-  (block $returned
-    (block $awaited
-      (try
-        (stack.switch $rejecting (local.get $error) (global.get_clear $appstack))
-      catch $awaiting $awaited
-      catch $returning $returned
-      )
-    ) ;; $awaited : [externref stackref]
-    (return (call $create_promise))
-  ) ;; $returned : [f64]
-  (call $f64_externref)
-)
-```
-and then revise the imported function `$create_promise : [externref] -> [externref]` similarly as follows:
-```
-(promise) => promise.then((x) => module_instance.resolve(x),
-                          (e) => module_instance.reject(e))
-```
-
-Beyond providing a useful optimization, this variant illustrates the substantial flexibility this proposal provides applications for determining how best to implement stack-based features according to their specific circumstances.
+As an example of the utility of this generalization, we illustrate [here](studies/Async-with-redirrectto.md) how this enables even more efficient support for asynchronous I/O if the application is willing to assume it has only one stack live at a time.
 
 ## Summary
 
