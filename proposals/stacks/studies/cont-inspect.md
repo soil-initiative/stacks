@@ -1,6 +1,6 @@
-# Case Study: Cont
+# Case Study: Cont using stack inspection
 
-Here we consider how this proposal supports the concepts of the `cont` design in [WebAssembly/design#1359](https://github.com/WebAssembly/design/issues/1359).
+Here we consider how this proposal supports the concepts of the `cont` design in [WebAssembly/design#1359](https://github.com/WebAssembly/design/issues/1359) using a stack-inspection-based implementation.
 
 ## Background
 
