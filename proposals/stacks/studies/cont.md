@@ -53,21 +53,25 @@ Then, to fix this example, we have to introduce a loop:
     (case $yield ;; cont on stack
       (call $enqueue)
     )
-    (case $fork ;; proc and cont on stack
+    (case $spawn ;; proc and cont on stack
       (cont.new) (call $enqueue)
       (call $enqueue)
     )
     (default ;; evtref on stack
       (cont.forward $on_event (event $yield $spawn))
-      (br $l)
     )
   )
+  (br $l)
 )
 ```
 
+Alternatively, it could be that `cont.forward` is not a renaming of `cont.reyield` from the in-person meeting and instead is meant to drop the current continuation and then forward the event to its parent.
+But there is no discussion on how one would unwind the current continuation.
+Given that the instruction is not even reachable in the only example provided, we have little information with which to work with.
+
 ## Events
 
-Ideally an event `(event $evt (param tp*) (result tr*))` would translate to a [call tag](https://github.com/WebAssembly/call-tag): `(call_tag $evt (param tp*) (resulttr*))`, and similarly the instruction `cont.suspend $evt : [tp*] -> [tr*]` would translate to `call_stack $evt`.
+Ideally an event `(event $evt (param tp*) (result tr*))` in the `cont` design would translate to a [call tag](https://github.com/WebAssembly/call-tag): `(call_tag $evt (param tp*) (resulttr*))`, and similarly the instruction `cont.suspend $evt : [tp*] -> [tr*]` would translate to `call_stack $evt`.
 This would open up the possibility that the relevant `answer` for the `$evt` could be more efficiently provided without any stack switch at all.
 But that possibility is currently inexpressible in the `cont` design, illustrating one of its shortcomings.
 Furthermore, the `br_on_evt` and `evtref` aspect of the `cont` design makes it poorly aligned with stack inspection in the future.
@@ -104,7 +108,7 @@ The first field indicates the "parent" reference to update when one "attaches" t
 
 Note that `$cont` has no type parameters.
 We found that using input types `tp*` constrained stack-switching patterns.
-So a `(cont ([tp*] -> [tr*]))` corresponds to a stack that is waiting for a specific "resuming" input-only event with payload `tp*`, which we will denote with `(event $resuming<tp*> (param tp*))`.
+So a `(cont ([tp*] -> [tr*]))` corresponds to a stack that is waiting for a specific "attaching" input-only event `(event $attaching (param exnref))`, where the `exnref` is in turn a "resuming" event `(event $resuming<tp*> (param tp*))`.
 We also do not use return types, since a return is implemented as a stack switch that cleans up the former stack (i.e. `stack.switch_drop`).
 So a `(cont ([tp*] -> [tr*]))` corresponds to a stack that "ends" with a specific "returning" input-only event with payload `tr*`, which we will denote with `(event $returning<tr*> (param tr*))`.
 
@@ -133,7 +137,6 @@ where the `rout` template `$cont_rout<tp*;tr*>` is defined as follows:
 (call_tag $canon<tp*;tr*> (param tp*) (result tr*))
 (call_tag $forward (param exnref $hook stackref))
 (event $detaching : [exnref stackref])
-(event $attaching : [exnref])
 
 (rout $cont_rout<tp*;tr*> (param $parent $hook) (param $f funcref)
   (stack.redirect_to ;; redirect any thrown exceptions to the parent
@@ -142,10 +145,14 @@ where the `rout` template `$cont_rout<tp*;tr*>` is defined as follows:
     (struct.set_cleared 0 (local.get $parent)) ;; [stackref] -> []
   within
     (block $resumed
-      (try
-        stack.start
-      catch $resuming<tp*> $resumed
-      )
+      (block $attached
+        (try
+          stack.start
+        catch $attaching $attached
+        )
+      ) ;; $attached : [exnref]
+      (br_on_exn $resuming<tp*> $resumed)
+      (unreachable)
     ) ;; $resumed : [tp*]
     (answer $suspend ;; [exnref] -> [exnref]
       (block $attached
@@ -176,9 +183,9 @@ where the `rout` template `$cont_rout<tp*;tr*>` is defined as follows:
 
 `$cont_rout` has a lot of machinery because a `cont` is many concepts bundled together.
 
-First, note that `stack.start` is set up to receive a `$resuming` event.
-Once that happens, `$cont_rout` will store the former stack as its parent and then proceed to call the given function reference.
-After that call completes, `$cont_rout` then switches back to the parent stack with the `$returning` event.
+First, note that `stack.start` is set up to receive an `$attaching` event.
+Once that happens, `$cont_rout` will then proceed to call the given function reference.
+After that call completes, `$cont_rout` then switches back to the parent stack with the `$returning<tr*>` event.
 
 The entire time, `$cont_rout` is set up to forward any exceptions that get thrown to the parent stack.
 This is done using a more general variant of `stack.redirect` that is presented [here](https://github.com/soil-initiative/stacks/pull/9/files), which in particular allows one to use a mutable field rather than a local variable to determine where to redirect to.
@@ -202,7 +209,7 @@ The list of events `$evt*` is provided to enable some static filtering on the ev
 We will put this aside for now and discuss it later when we discuss other optimizations.
 
 The label `$label` expects an `evtref tr*`.
-We translate this type to `$evtref = ref (struct exnref (mut stackref) $hook)`, with the understanding that the `structref` is waiting for an `$attaching` event and will conclude with a `$returning<tr*>` event if it "returns".
+We translate this type to `$evtref = ref (struct exnref $cont)`.
 
 We can translate this to the following:
 ```
@@ -210,29 +217,33 @@ We can translate this to the following:
   (let (local $c $cont)
     (block $detached
       (try
+        (exnref.new $resuming<tp*>)
         (struct.get 0 (local.get $c))
         (struct.get_clear 1 (local.get $c))
-        (stack.switch_call $resume_set_parent<tp*> $resuming<tp*>)
+        (stack.switch_call $attach_set_parent $attaching)
       catch $detaching $detached
       catch $returning<tr*> $returned
       )
     ) ;; $detached : [exnref stackref]
-    (struct.get 0 (local.get $c))
-    (struct.new $evtref)
-    (br $label)
+    (let (local $e exnref) (local $s stackref)
+      (struct.new $evtref (local.get $e)
+                          (struct.new $cont (struct.get 0 (local.get $c)))
+                                            (local.get_clear $s))
+      (br $label)
+    )
   )
 ) ;; $returned : [tr*]
 ```
 where
 ```
-(func $resume_set_parent<tp*> (param $p* tp*) (param $parent $hook) (param $s stackref) (result tp*))
+(func $attach_set_parent (param $e exnref) (param $parent $hook) (param $s stackref) (result exnref))
   (struct.set_cleared (local.get $parent) (local.get_clear $s))
-  (local.get $p*)
+  (local.get $e)
 )
 ```
 
-These instructions switch control to the `stackref` representing the continuation, using `stack.switch_call $resume_set_hook<tp*>` to set the parent of the continuation to be the current stack.
-They then wait for that `stackref` to either "detach" (via the `$detaching` event) or to "return" (via the `$returning` event).
+These instructions switch control to the `stackref` representing the continuation, using `stack.switch_call $attach_set_parent` to set the parent of the continuation to be the current stack.
+They then wait for that `stackref` to either "detach" (via the `$detaching` event) or to "return" (via the `$returning<tr*>` event).
 Note that the handler for detaching branches to `$label` and makes the allocation of the `evtref` explicit.
 
 ## Handling an event
@@ -252,47 +263,20 @@ We can translate this to the following:
       (local.get $e)
       (br $mismatched)
     ) ;; $matched : [tp*]
-    (struct.get 0 (local.get $e))
-  ) ;; [tp*]
-  (struct.get 2 (local.get $e))
-  (stack.extend $resume<$evt> $attaching (struct.get_clear 1 (local.get $e)))
-  (struct.new $cont)
-  (br $label)
+    (struct.get 1 (local.get $e))
+    (br $label)
+  )
 ) ;; $mismatched : [$evtref]
 ```
-where
-```
-(rout $resume<$evt> (result exnref)
-  (block $resumed
-    (try
-      (stack.start)
-    catch $resuming<tr*> $resumed
-    )
-  ) ;; [tr*]
-  (exnref.new $outputs<$evt>)
-)
-```
-
-This translation works by checking if the tag of the `exnref` in the `$evtref` matches that of the (`$inputs` of) the expected event `$evt`.
-If they match, it then has to perform some bookkeeping.
-The `stackref` in an `$evtref` is waiting for an `$attaching` event, whereas the `stackref` in a `cont ([tr*] -> [t*])` is supposed to be waiting for a `$resuming<tr*>` event.
-At the time we detached the continuation, we did not know what the event was since we do not have meta-instructions for operating on arbitrary events, so we left it in a generic wait-for-`$attaching` state.
-With `br_on_exn` we now have a specific event to work with.
-So we attach a `$resume<$evt>` frame to the `stackref` in the `$cont` to convert from the specialized `$resuming<tr*>` event to the general `$attaching` event.
-
-Interestingly, this application of `stack.extend` is not one we had anticipated.
-But its design fits perfectly with our needs here.
-This suggests that it is indeed useful to keep it as an independent primitive rather than solely bake it into particularly common operations.
-Plus it illustrates the versatility of this proposal.
 
 ## Forwarding an event
 
-The `cont` design expects a specific pattern: detach when an event occurs, examine the event, forward it if it not an event you are looking for.
+The `cont` design expects a specific pattern: detach when an event occurs, examine the event, forward it if is not an event you are looking for.
 The final step is done with the following (fixed) instruction:
 ```
 cont.forward $label (event $evt*) : [(evtref tr*)] -> [tr*]
 ```
-where `label $label : [evtref]`.
+where `label $label : [(evtref tr*)]`.
 
 We can translate this to the following:
 ```
@@ -300,18 +284,23 @@ We can translate this to the following:
   (let (local $e $evtref)
     (block $detached
       (try
-        (call_stack $forward (struct.get 0 (local.get $e)) (struct.get 2 (local.get $e)) (struct.get_clear 1 (local.get $e)))
+        (call_stack $forward (struct.get 0 (local.get $e))
+                             (struct.get 0 (struct.get 1 (local.get $e)))
+                             (struct.get_clear 1 (struct.get 1 (local.get $e))))
       catch $detaching $detached
       catch $returning<tr*> $returned
       )
     ) ;; $detached : [exnref stackref]
-    (struct.get 2 (local.get $e))
-    (struct.new $evtref)
-    (br $label)
+    (let (local $ex exnref) (local $s stackref)
+      (struct.new $evtref (local.get $ex)
+                          (struct.new $cont (struct.get 0 (struct.get 1 (local.get $e)))
+                                            (local.get_clear $s))
+      (br $label)
+    )
   )
 ) ;; $returned : [tr*]
 ```
-This illustrates that `cont.forward` does a stack walk to find the current continuation's parent to forward the event to.
+This illustrates that `cont.forward` does a stack inspection to find the current continuation's parent to forward the event to.
 It also illustrates how we make use of the fact that a `call_stack` can throw exceptions just like a normal `call`.
 In particular, the handler for `$detaching` should be specified here, rather than within an `answer` to `$forward`, because it (after some bookkeeping) jumps to a locally specified label.
 
