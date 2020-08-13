@@ -543,7 +543,7 @@ stack.redirect $local instr* end : [ti*] -> [to*]
 ```
 where `local $local : stackref` and `instr* : [ti*] -> [to*]`
 
-During the execution of `instr*`, whenever a stack walk reaches `stack.direct`, the stack walk is redirected to the `stackref` in `$local` at that time.
+During the execution of `instr*`, whenever a stack walk reaches `stack.redirect`, the stack walk is redirected to the `stackref` in `$local` at that time.
 If that value is null, then the stack walk continues up the current stack.
 Otherwise, the value `$local` is set to null (to prevent the `stackref` from being switched to while it is being walked).
 When the stack walk completes, `$local` is set to its former value (trapping if `$local` is not null).
@@ -598,8 +598,6 @@ where `event $event : [t*]`
 
 Switches control to the given `stackref` (trapping if null), providing the specified `$event` with the given `t*` as its payload.
 But before that event is handled on the given `stackref`, the stack that yielded control is first cleaned up.
-
-When the stack that yielded control is switched back to with some event, that event (*not* `$event`) is thrown from `stack.switch`.
 
 ### Linear Types
 
