@@ -523,83 +523,118 @@ Here we summarize the new instructions/constructs introduced above and how they 
 
 #### Instructions
 
-* `stack.extend`
+##### `stack.extend`
 
 ```
 stack.extend $rout $event? : [ti* stackref] -> [stackref]
 ```
 where `rout $rout : [ti*] -> [to*]` and `event $event : [to*]` (if specified)
 
-* `stack.redirect`
+Adds a stack frame to the given `stackref`, returning the reference to newly extended stack (and trapping if the given `stackref` is null).
+The data content of the stack frame as given by the `ti*` values.
+The code content of the stack frame (i.e. the address of the handler code) is given by the `$rout`, specifically by the location of `stack.start` in the definition of `$rout`.
+Because the given `stackref` was expecting an event, the optional `$event` specifies what event to use if/when the `$rout` returns to it.
+If no event is specified, then the `$rout` traps if/when it attempts to return to its parent stack frame.
+
+##### `stack.redirect`
 
 ```
 stack.redirect $local instr* end : [ti*] -> [to*]
 ```
 where `local $local : stackref` and `instr* : [ti*] -> [to*]`
 
-* `stack.start` (usable only in specific locations within a `rout`)
+During the execution of `instr*`, whenever a stack walk reaches `stack.redirect`, the stack walk is redirected to the `stackref` in `$local` at that time.
+If that value is null, then the stack walk continues up the current stack.
+Otherwise, the value `$local` is set to null (to prevent the `stackref` from being switched to while it is being walked).
+When the stack walk completes, `$local` is set to its former value (trapping if `$local` is not null).
+
+As a technical note, if a second stack walk reaches `stack.redirect` while it is already redirecting a stack walk, then the second stack walk is redirected to the same stack.
+This can only happen if the first stack walk initiates the second stack walk, so this is a bit of a corner case.
+That fact guarantees, though, that the second stack walk cannot complete before the first stack walk completes.
+
+##### `stack.start`
 
 ```
 stack.start : [] -> unreachable
 ```
+(usable only in specific locations within a `rout`)
 
-* `stack.switch`
+This special instruction serves as a marker indicating where a `rout` starts.
+It can only be used within a `rout` and can only be preceded by a few kinds of instructions, e.g. `block`, `try`, and `stack.redirect`.
+It throws whatever event is used to transfer control to the stack that the `rout` was mounted onto.
+
+##### `stack.switch`
 
 ```
 stack.switch $event : [t* stackref] -> unreachable
 ```
 where `event $event : [t* stackref]`
 
-* `stack.switch_call`
+Switches control to the given `stackref` (trapping if null), providing the specified `$event` with the given `t*` as all but the last value in its payload.
+The last value of the payload is the reference to the stack that yielded control (*not* the value of the given `stackref`).
+
+When the stack that yielded control is switched back to with some event, that event (*not* `$event`) is thrown from `stack.switch`.
+
+##### `stack.switch_call`
 
 ```
 stack.switch_call $func $event? : [ti* stackref] -> unreachable
 ```
 where `func $func : [ti* stackref] -> [to*]` and `event $event : [to*]` (if specified)
 
-* `stack.switch_drop`
+Switches control to the given `stackref` (trapping if null) and then calls `$func` on that stack, passing the given `ti*` as all but the last argument to the function.
+The last argument is the reference to the stack that yielded control (*not* the value of the given `stackref`).
+Because the given `stackref` was expecting an event, the optional `$event` specifies what event to use if/when the `$func` returns to it.
+If no event is specified, then the `$func` traps if/when it attempts to return to its parent stack frame.
+
+When the stack that yielded control is switched back to with some event, that event (*not* `$event`) is thrown from `stack.switch_call`.
+
+##### `stack.switch_drop`
 
 ```
 stack.switch_drop $event : [t* stackref] -> unreachable
 ```
 where `event $event : [t*]`
 
+Switches control to the given `stackref` (trapping if null), providing the specified `$event` with the given `t*` as its payload.
+But before that event is handled on the given `stackref`, the stack that yielded control is first cleaned up.
+
 ### Linear Types
 
 These instructions are used to support linear types.
 They all either clear (i.e. set to `null`) a store after getting its value, or check that a store is cleared before setting it to a value.
 
-* `global.get_clear`
+##### `global.get_clear`
 
 ```
 global.get_clear $global : [] -> [t]
 ```
 
-* `global.set_cleared`
+##### `global.set_cleared`
 
 ```
 global.set_cleared $global : [t] -> []
 ```
 
-* `local.get_clear`
+##### `local.get_clear`
 
 ```
 local.get_clear $local : [] -> [t]
 ```
 
-* `local.set_cleared`
+##### `local.set_cleared`
 
 ```
 local.set_cleared $local : [t] -> []
 ```
 
-* `table.get_clear`
+##### `table.get_clear`
 
 ```
 table.get_clear $table : [i32] -> [t]
 ```
 
-* `table.set_cleared`
+##### `table.set_cleared`
 
 ```
 table.set_cleared $table : [i32 t] -> []
@@ -609,19 +644,23 @@ table.set_cleared $table : [i32 t] -> []
 
 We list only the features that we would need from a complete suite of operations for stack inspection.
 
-* `answer`
+##### `answer`
 
 ```
 answer $call_tag instr1* within instr2* end : [ti2*] -> [to2*]
 ```
 where `call_tag $call_tag : [ti1*] -> [to1*]` and `instr1* : [ti1*] -> [to1*]` and `instr2* : [ti2*] -> [to2*]`
 
-* `call_stack`
+Executes `instr2*`, during which answering any `call_stack $call_tag` that reaches this `answer` by executing `instr1*`.
+
+##### `call_stack`
 
 ```
 call_stack $call_tag : [ti*] -> [to*]
 ```
 where `call_tag $call_tag : [ti*] -> [to*]`
+
+Looks up the current stack for an `answer $call_tag` and executes it with the given `ti*` as inputs, returning here with the `to*` it outputs.
 
 ## Appendix: Frequently Asked Questions (FAQ)
 
