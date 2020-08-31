@@ -567,6 +567,18 @@ As a technical note, if a second stack walk reaches `stack.redirect` while it is
 This can only happen if the first stack walk initiates the second stack walk, so this is a bit of a corner case.
 That fact guarantees, though, that the second stack walk cannot complete before the first stack walk completes.
 
+##### `stack.redirect_to`
+
+```
+stack.redirect_to instr1* then instr2* within instr3* end : [ti*] -> [to*]
+```
+* where `instr1* : [] -> [stackref]` specifies the instructions to run to determine where to redirect to
+* where `instr2* : [stackref] -> []` specifies the instructions to run after the redirection is done (returning the `stackref` that was redirected to)
+* and `instr3* : [ti*] -> [to*]` are the instructions whose stack walks get redirected.
+
+`stack.redirect_to` is a generalization of `stack.redirect $local` that enables arbitrary code to be run to determine which `stackref` to redirect walks to and to handle the `stackref` after the walks complete.
+The latter translates to `stack.redirect_to (local.get_clear $local) then (local.set_cleared $local) within instr* end`.
+
 ##### `stack.start`
 
 ```
