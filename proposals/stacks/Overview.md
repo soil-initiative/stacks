@@ -362,6 +362,9 @@ For now we assume we have the following instructions for stack inspection (using
 ### Application&mdash;Async/Await
 
 Now we put the pieces together to illustrate how a program written in a synchronous style can be made asynchronous using stack composition.
+There are multiple implementation strategies for providing this functionality.
+The one we focus on here enables a module instance to have multiple stacks live at a time, but a case study is provided [here](studies/Async-with-redirectto.md) for a more optimized implementation strategy for when a module instance is intended to have only one stack live at a time.
+
 At a high-level, every external entry point to the WebAssembly program allocates a new internal stack to run the program on and then uses redirection to make it appear as if the program is running on the original stack.
 Whenever the program has to wait for some promise, it removes the redirection, registers the internal stack as part of a listener on the promise, and returns control to the original stack.
 When the promise resolves, the internal stack sets up a redirection to the promise's stack, and continues executing the program.
