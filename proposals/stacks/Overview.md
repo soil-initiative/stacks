@@ -150,7 +150,7 @@ As such, the module imports a `$new_stack` function from the host, which it uses
 (func $spawn_thread (param $work $task) (result i32) (local $id i32) (local $stack stackref)
   (local.set $id (call $find_noncurrent_null_in_thread_pool))
   (local.set_cleared $stack (call $new_stack))
-  (local.set_cleared $stack (stack.extend $thread_rout (local.get $id) (local.get $work) (local.get_clear $stack)))
+  (local.set_cleared $stack (stack.extend $thread_root (local.get $id) (local.get $work) (local.get_clear $stack)))
   (table.set_cleared $thread_pool (local.get $id) (local.get_clear $stack))
   (local.get $id)
 )
@@ -161,20 +161,19 @@ The `$spawn_thread` function finds an unused identifier for the thread, uses the
 The extension step is critical.
 Realize that all the imported `$new_stack` function does is provide a `stackref` for some new stack, one that is conceptually blank besides its grounding frame.
 
-In order to give this stack some functionality specific to the application at hand, one must extend the given stack with a special kind of call frame specific to the application at hand.
-Because this concept is inspired by coroutines and typically is used to set up the root of the stack, we call this special kind of function a `rout`.
-The following is an example `rout` for a lightweight thread:
+In order to give this stack some functionality specific to the application at hand, one must extend the given stack with a call frame specific to the application at hand.
+The following is an example call frame for a lightweight thread:
 ```
 (event $abort : [stackref])
 (event $thread_aborted : [])
 (func $do_work (param $task) (result $product) ...)
 
-(rout $thread_rout (param $id i32) (param $input $task) (local $output $product)
+(rout $thread_root (param $id i32) (param $input $task) (local $output $product)
   (block $aborted
     (try
       (block $resumed
         (try
-          stack.start
+          stack.start ;; explained below
         catch $resume $resumed
         )
       ) ;; $resumed
@@ -187,31 +186,42 @@ The following is an example `rout` for a lightweight thread:
 )
 ```
 
-A `rout` is similar to a `func` but with one critical difference: the first instructions of the body must be instructions like `block` and `try` that do nothing besides set up control flow, followed by `stack.start`.
-This sets up a stack frame that is awaiting an event and set to handle that event.
+To add a stack frame to a stack, one uses the following instruction:
+```
+stack.extend $func $event? : [ti* stackref] -> [stackref]
+```
+where `$func` is a `func (param ti*) (result to*)` and `$event` (if specified) is an `event (param to*)`, extends the given stack with the frame for `$func` with the given values as its arguments.
 
-To add a `rout` stack-frame to a stack, one uses the following instruction:
-```
-stack.extend $rout $event? : [ti* stackref] -> [stackref]
-```
-where `$rout` is a `rout (param ti*) (result to*)` and `$event` (if specified) is an `event (param to*)`, extends the given stack with the frame for `$rout` with the given values as its arguments.
-The resulting stack is waiting for an event at the following special instruction that is only usable at the near-start of a `rout`:
-```
-stack.start : [] -> unreachable
-```
-If an `$event` is specified, then once the stack is switched to and handled by the `rout` such that it returns, the returned values are forwarded to the `stackref` the `rout` was attached to with the specified event.
-If no `$event` is specified, then the `rout` traps if it returns.
-Any unhandled exceptions thrown from the `rout` are forwarded to the `stackref` the `rout` was attached to.
+However, to make this extension useful, we need the added frame to configure the stack to receive switching events.
+So far, `func` was designed with the expectation that, after one sets up the frame with the parameters for the function, one then immediately starts executing the body of the function.
+With extension, though, there is now a disconnect between these two steps that we need to address.
 
-So if one calls an imported function `$new_stack : [] -> [stackref]` and then executes `(stack.extend $thread_rout (i32.const 237) $work)`, that altogether creates a new stack that is
+Notice that the first few instructions of `$thread_root` do not actually do any computation.
+Instead, they set up control flow and event handlers.
+So if a *call* to `$thread_root` were to start at the instruction `stack.start`, you would not be able to tell the difference from starting at the beginning of the body.
+On the other hand, the difference between the two is quite apparent when we extend a stack with `$thread_root` and then try to switch to it.
+At the beginning of the body, there are no event handlers configured in the immediate context, and as such a stack switch would result in the switching event completely skipping the `$thread_root` frame, propagating further up the stack.
+This makes stack extension completely useless.
+
+To address this problem, this proposal enables the body of a `func` to use a `stack.start` instruction to explicitly specify the entry for the function, i.e. the point within the body that (suspended) execution should start from.
+In `$thread_root`, the execution point where `stack.start` lies is configured to directly handle `$resume` and `$abort` events, making `$thread_root` useful for stack switching.
+Of course, the location of `stack.start` cannot be arbitrary; for standard function calls, it must be indistinguishable from starting execution from the beginning of the body.
+Specifically, `stack.start` can only be preceded by the following instructions:
+* `block`
+* `loop`
+* `try`
+* `answer instr* within` (described below)
+* `stack.redirect` (described below)
+
+Putting this all together, if one calls an imported function `$new_stack : [] -> [stackref]` and then executes `(stack.extend $thread_root (i32.const 237) $work)`, that creates a new stack that is
 1. waiting for its first `$resume` event,
 2. upon which it will call `$do_thread_work` with the given `$work`,
 3. which in turn can yield control to the thread manager via `(call $yield_current_thread)` (defined above),
-4. and after all the work is complete it will return control to the thread manager, providing the result of the work via the event `$work_completed`.
+4. and, after all the work is complete, will return control to the thread manager, providing the result of the work via the event `$work_completed`.
 
 ### Stack Cleanup
 
-Notice that `$thread_rout` also handles an `$abort` event, which provides a `stackref` in its payload.
+Notice that `$thread_root` also handles an `$abort` event, which provides a `stackref` in its payload.
 This is used to unwind the stack of a thread that has been aborted.
 Although discarding a leaf reference implicitly causes the stack to be cleaned up, along with any stacks that it contains references to, this process does nothing more than memory management.
 That is, besides side channels like timing behavior, this process has no visible semantic effect.
@@ -230,9 +240,9 @@ Because we build upon exception-handling events, this can be done simply with th
 ```
 Note that the `$yield_current_thread` function does not handle the `$abort` event.
 As such, when a yielded thread stack is switched to, the event gets thrown as an exception.
-The expectation is that, except for its root `$thread_rout`, the thread will not catch the `$abort` event.
+The expectation is that, except for its root `$thread_root`, the thread will not catch the `$abort` event.
 This in turn causes all of the unwinding code on its stack to execute.
-As for `$thread_rout`, the switch in `$abort_thread` packages the `stackref` of whoever called `$abort_thread`, which `$thread_rout` finally extracts and switches control back to (implicitly cleaning up the last remnants of the aborted thread's stack in the process).
+As for `$thread_root`, the switch in `$abort_thread` packages the `stackref` of whoever called `$abort_thread`, which `$thread_root` finally extracts and switches control back to (implicitly cleaning up the last remnants of the aborted thread's stack in the process).
 
 ### Application&mdash;Lightweight Threads
 
@@ -340,7 +350,7 @@ This instruction executes `instr*` but redirects an exceptions thrown therein to
 Stack inspections are similarly redirected.
 If `$local` is null at the relevant time, then no redirection occurs.
 
-Given that `stack.redirect` does nothing upon entry, like `block` and `try`, it is allowed to preceed `stack.start` in a `rout`.
+Given that `stack.redirect` does nothing upon entry, like `block` and `try`, it is allowed to precede the `stack.start` instruction.
 
 ### Stack Inspection
 
@@ -533,26 +543,22 @@ Here we summarize the new instructions/constructs introduced above and how they 
 
 #### Types
 
-* `stackref`: reference to a complete stack
-
-### Forms
-
-* `rout`: variant of `func` using `stack.start`
+`stackref`: reference to (the leaf of) a complete stack
 
 #### Instructions
 
 ##### `stack.extend`
 
 ```
-stack.extend $rout $event? : [ti* stackref] -> [stackref]
+stack.extend $func $event? : [ti* stackref] -> [stackref]
 ```
-where `rout $rout : [ti*] -> [to*]` and `event $event : [to*]` (if specified)
+where `func $func : [ti*] -> [to*]` and `event $event : [to*]` (if specified)
 
-Adds a stack frame to the given `stackref`, returning the reference to newly extended stack (and trapping if the given `stackref` is null).
+Adds a stack frame to the given `stackref`, returning the reference to the newly extended stack (and trapping if the given `stackref` is null).
 The data content of the stack frame as given by the `ti*` values.
-The code content of the stack frame (i.e. the address of the handler code) is given by the `$rout`, specifically by the location of `stack.start` in the definition of `$rout`.
-Because the given `stackref` was expecting an event, the optional `$event` specifies what event to use if/when the `$rout` returns to it.
-If no event is specified, then the `$rout` traps if/when it attempts to return to its parent stack frame.
+The code content of the stack frame (i.e. the address of the handler code) is given by the `$func`, specifically by the location indicated by the `stack.start` instruction in the body of `$func`.
+Because the given `stackref` was expecting an event, the optional `$event` specifies what event to use if/when the `$func` returns to it.
+If no event is specified, then the `$func` traps if/when it attempts to return to its parent stack frame.
 
 ##### `stack.redirect`
 
@@ -585,13 +591,19 @@ The latter translates to `stack.redirect_to (local.get_clear $local) then (local
 ##### `stack.start`
 
 ```
-stack.start : [] -> unreachable
+stack.start : [] -> []
 ```
-(usable only in specific locations within a `rout`)
+with the restriction that the instruction only be used within the definition of a `func` and therein only be preceded by the following instructions:
+* `block`
+* `loop`
+* `try`
+* `answer instr* within`
+* `stack.redirect`
 
-This special instruction serves as a marker indicating where a `rout` starts.
-It can only be used within a `rout` and can only be preceded by a few kinds of instructions, e.g. `block`, `try`, and `stack.redirect`.
-It throws whatever event is used to transfer control to the stack that the `rout` was mounted onto.
+This special instruction solely indicates where execution of a `func` starts within its body.
+Its only effect is to determine where stack switching events should be thrown from within the function body if the `func` were added to a stack with the `stack.extend` instruction.
+The usage restrictions ensure that a `func` definition has at most one `stack.start` instruction.
+If a `func` definition has no `stack.start` instruction, it is considered to have the instruction at the beginning of the function body.
 
 ##### `stack.switch`
 
@@ -710,7 +722,7 @@ Each prior proposal implicitly relied on automatic memory management (and finali
 Furthermore, each prior proposal implicitly baked in some locking and/or invalidating policy to prevent multiple accesses to the same stack.
 By using linear types, our instructions can be implemented more efficiently, knowing they have the only reference to the stack, and the application can have more control to design and implement its own policies for managing a linear resource.
 
-Lastly, our introduction of `rout` enables more efficient initialization, extension, and composition of stacks *without* requiring switching to the stack being modified and back.
+Lastly, our introduction of `stack.start` enables more efficient initialization, extension, and composition of stacks *without* requiring switching to the stack being modified and back.
 
 In short, we believe the prior proposals were all headed in the direction of this proposal.
 We have just examined a wider range of applications in more depth, and in doing came across opportunities to break higher-level operations down into orthogonal lower-level operations.
@@ -718,7 +730,7 @@ We have just examined a wider range of applications in more depth, and in doing 
 On that note, some of the more complex aspects of this proposal are due to WebAssembly's bundling of code-state, stack-state, and syntactic nesting.
 For example, we found it useful to realize that a label specifies both a code pointer *and* a stack pointer.
 Similarly, a branch jumps to the code pointer *and* cleans up the stack below the given stack pointer.
-The fact that labels and the like are established through syntactic nesting is what necessitated `rout` as a distinct concept from `func`.
+The fact that labels and the like are established through syntactic nesting is what necessitated `stack.start` as a marker inside `func` bodies.
 This is not to say this bundling is a fault in the design of WebAssembly, since in many ways we benefited from it, but it is important for understanding the rationale behind the design of this proposal and why certain instructions/constructs could not be decomposed further.
 
 ### What are the key dependencies?
