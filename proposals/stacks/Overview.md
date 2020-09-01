@@ -362,6 +362,9 @@ For now we assume we have the following instructions for stack inspection (using
 ### Application&mdash;Async/Await
 
 Now we put the pieces together to illustrate how a program written in a synchronous style can be made asynchronous using stack composition.
+There are multiple implementation strategies for providing this functionality.
+The one we focus on here enables a module instance to have multiple stacks live at a time, but a case study is provided [here](studies/Async-with-redirectto.md) for a more optimized implementation strategy for when a module instance is intended to have only one stack live at a time.
+
 At a high-level, every external entry point to the WebAssembly program allocates a new internal stack to run the program on and then uses redirection to make it appear as if the program is running on the original stack.
 Whenever the program has to wait for some promise, it removes the redirection, registers the internal stack as part of a listener on the promise, and returns control to the original stack.
 When the promise resolves, the internal stack sets up a redirection to the promise's stack, and continues executing the program.
@@ -496,6 +499,21 @@ As such, the thrown exception will get handled by the code in `$entry` just like
 
 And with that, we have an efficient implementation of the async/await pattern, with the only reliance on the JS API being to register the handlers on the given promise, and with the property that each JS event runs to completion (assuming it terminates).
 
+### Generalized Variant
+
+Currently, `stack.redirect` specifies a local variable to use to determine where to redirect to when a stack walk occurs.
+We could more generally have `stack.redirect` specify a computation to run to determine where to redirect to, as follows:
+```
+stack.redirect_to instr1* then instr2* within instr3* end : [ti*] -> [to*]
+```
+* where `instr1* : [] -> [stackref]` specifies the instructions to run to determine where to redirect to
+* where `instr2* : [stackref] -> []` specifies the instructions to run after the redirection is done (returning the `stackref` that was redirected to)
+* and `instr3* : [ti*] -> [to*]` are the instructions whose stack walks get redirected.
+
+Using this, `stack.redirect $local instr* end` is the special case `stack.redirect_to (local.get_clear $local) then (local.set_cleared $local) within instr* end`.
+But now we can support other redirection patterns, such as getting/setting a mutable field of some heap reference, getting/setting an entry in a table, or getting/setting a *global* variable.
+As an example of the utility of this generalization, we illustrate [here](studies/Async-with-redirrectto.md) how this enables even more efficient support for asynchronous I/O if the application is willing to assume it has only one stack live at a time.
+
 ## Summary
 
 This proposal outlines a suite of features that can be used to implement various patterns of non-sequential control flow: coroutines (both symmetric and asymmetric), support for asynchronous I/O, delimited continuations and many more.
@@ -551,6 +569,18 @@ When the stack walk completes, `$local` is set to its former value (trapping if 
 As a technical note, if a second stack walk reaches `stack.redirect` while it is already redirecting a stack walk, then the second stack walk is redirected to the same stack.
 This can only happen if the first stack walk initiates the second stack walk, so this is a bit of a corner case.
 That fact guarantees, though, that the second stack walk cannot complete before the first stack walk completes.
+
+##### `stack.redirect_to`
+
+```
+stack.redirect_to instr1* then instr2* within instr3* end : [ti*] -> [to*]
+```
+* where `instr1* : [] -> [stackref]` specifies the instructions to run to determine where to redirect to
+* where `instr2* : [stackref] -> []` specifies the instructions to run after the redirection is done (returning the `stackref` that was redirected to)
+* and `instr3* : [ti*] -> [to*]` are the instructions whose stack walks get redirected.
+
+`stack.redirect_to` is a generalization of `stack.redirect $local` that enables arbitrary code to be run to determine which `stackref` to redirect walks to and to handle the `stackref` after the walks complete.
+The latter translates to `stack.redirect_to (local.get_clear $local) then (local.set_cleared $local) within instr* end`.
 
 ##### `stack.start`
 
